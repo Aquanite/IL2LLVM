@@ -59,16 +59,6 @@ namespace IL2LLVM.Compiler
 
         private static string Mangle(string declaringTypeName, string methodName, IEnumerable<ParameterDefinition> parameters)
         {
-            if (methodName == "Main" && declaringTypeName == "Program")
-            {
-                // Special case for entry point
-                return "main";
-            }
-            if (methodName == ".cctor" && declaringTypeName == "Program")
-            {
-                // Special case for entry point
-                return "main.cctor";
-            }
 
             methodName = declaringTypeName + "." + methodName;
             methodName = methodName.Replace("`", ".bt."); // Sanitize generics

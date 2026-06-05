@@ -66,6 +66,7 @@ namespace IL2LLVM.Compiler
         private string[] ArgTypes => argTypes ?? throw new InvalidOperationException("Argument types not initialized.");
         private Dictionary<Instruction, string> InstructionLabels => instructionLabels ?? throw new InvalidOperationException("Instruction labels not initialized.");
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
+        private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -83,6 +84,16 @@ namespace IL2LLVM.Compiler
                 Emitter.WriteLine(label);
             }
             Emitter.WriteLine("; DECLARE END\n");
+        }
+
+        private void CallCctorIfNeeded(string cctor)
+        {
+            if (CalledCctors.Contains(cctor))
+                return; // Already initialized
+            
+            Emitter.WriteLine($"    call void @{cctor}()");
+
+            CalledCctors.Add(cctor);
         }
 
         public void Run(string outFile)
@@ -211,11 +222,13 @@ namespace IL2LLVM.Compiler
             }
 
             // Emit function header
-            string mangledName = Mangler.Mangle(method);
+            string mangledName = "";
+            if (IsEntryPoint(method))
+            {
+                mangledName = GetEntryPoint(method)!;
+            }
+            else mangledName = Mangler.Mangle(method);
             Emitter.WriteLine($"define {returnType} @{mangledName}({string.Join(", ", ArgTypes.Select((t, i) => $"{t} %arg{i}"))}) {{");
-
-            if (mangledName == "main")
-                Emitter.WriteLine("    call void @main.cctor()");
 
             // Compile method body
             foreach (var instruction in method.Body.Instructions)
@@ -285,15 +298,36 @@ namespace IL2LLVM.Compiler
                 : (string)attr.ConstructorArguments[0].Value;
         }
 
-        private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
+        private static string? GetEntryPoint(MethodDefinition method)
+        {
+            // Is it an entry point?
+            var attr = method.CustomAttributes.FirstOrDefault(a =>
+                a.AttributeType.FullName == "IL2LLVM.Attributes.EntryPoint");
 
-        private string ToLLVMUnicodeString(string str)
+            if (attr is null)
+                return null;
+
+            // Check if the paramless constructor
+            if (attr.ConstructorArguments.Count == 0)
+            {
+                return "main";
+            }
+
+            // ret name
+            string? renameTo = (string?)attr.ConstructorArguments[0].Value;
+            return renameTo ?? "main";
+        }
+
+        private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
+        private static bool IsEntryPoint(MethodDefinition method) => GetEntryPoint(method) != null;
+
+        private static string ToLLVMUnicodeString(string str)
         {
             byte[] utf16Bytes = System.Text.Encoding.Unicode.GetBytes(str);
             return string.Concat(utf16Bytes.Select(b => $"\\{b:X2}")) + "\\00\\00";
         }
 
-        private string ToLLVMAsciiString(string str)
+        private static string ToLLVMAsciiString(string str)
         {
             string built = "";
             byte[] str_bytes = Encoding.ASCII.GetBytes(str);
@@ -362,7 +396,7 @@ namespace IL2LLVM.Compiler
             };
         }
 
-        private string GetVarType(TypeReference variableType)
+        private static string GetVarType(TypeReference variableType)
         {
             if (variableType.IsPointer)
             {
@@ -404,7 +438,7 @@ namespace IL2LLVM.Compiler
             };
         }
 
-        bool IsWorkableType(string type)
+        static bool IsWorkableType(string type)
         {
             return type switch
             {
@@ -443,7 +477,7 @@ namespace IL2LLVM.Compiler
             return analyticalStack.Peek();
         }
 
-        void NOP() { }
+        static void NOP() { }
 
         void BREAK()
         {
@@ -527,7 +561,26 @@ namespace IL2LLVM.Compiler
         }
 
         void CALL(MethodReference method)
-        {
+        { 
+            if (!method.HasThis)
+            {
+                var typeDef = method.DeclaringType.Resolve();
+                if (typeDef != null)
+                {
+                    // See if CCTOR is called
+                    var cctorName = typeDef.Methods
+                        .FirstOrDefault(m => m.FullName.Contains("cctor"));
+
+                    if (cctorName != null)
+                        CallCctorIfNeeded(Mangler.Mangle(cctorName));
+                }
+                else
+                    throw new TypeLoadException(
+                        $"[ERROR] Fatal: Cannot resolve declaring type '{method.DeclaringType.FullName}'. " +
+                        $"The assembly containing this type is missing from Mono.Cecil's search paths. " +
+                        $"Cannot locate or invoke its '.cctor'."
+                    );
+            }
             // Assume name is mangled so we can mangle and call it directly
             string mangledName = Mangler.Mangle(method);
 
@@ -790,6 +843,13 @@ namespace IL2LLVM.Compiler
         void STSFLD(FieldDefinition field)
         {
 
+            // See if CCTOR is called
+            var cctorName = field.DeclaringType.Methods
+                .FirstOrDefault(m => m.FullName.Contains("cctor"));
+
+            if (cctorName != null)
+                CallCctorIfNeeded(Mangler.Mangle(cctorName));
+
             string fieldName = Mangler.Mangle(field);
             LLVMObject value = Pop();
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} {value.Type} {value.Value}, ptr @{fieldName}, align {GetAlignmentForType(value.Type)}");
@@ -799,6 +859,13 @@ namespace IL2LLVM.Compiler
 
         void LDSFLD(FieldDefinition field)
         {
+            // See if CCTOR is called
+            var cctorName = field.DeclaringType.Methods
+                .FirstOrDefault(m => m.FullName.Contains("cctor"));
+
+            if (cctorName != null)
+                CallCctorIfNeeded(Mangler.Mangle(cctorName));
+
             string fieldName = Mangler.Mangle(field);
             string fieldType = GetVarType(field.FieldType);
             string tempReg = $"%t_{tempRegisterCounter++}";
