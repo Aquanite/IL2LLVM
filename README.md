@@ -28,4 +28,4 @@ Contributions to IL2LLVM are welcome! If you have an idea for a new feature or h
 For questions or support, please open an issue on the GitHub repository or contact the maintainer at [@Aquanite, LLC](https://github.com/Aquanite).
 <br>
 Email:
-- [Nathan Hornby](mailto:Nathan.Hornby@aquanite.org)
+- [support@aquanite.org](mailto:support@aquanite.org)
