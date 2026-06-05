@@ -4,10 +4,16 @@ namespace ILTest;
 
 public class Program
 {
+    public static ulong len = 16;
+    public static void Before()
+    {
+        Test.Write("Hello from C# 🙂\n", len);
+    }
+    
     [EntryPoint]
     public static int Main()
     {
-        Test.Write("Hello from C# 🙂\n", 16);
+        Test.Write("Hello from C# 🙂\n", len);
         return 0;
     }
 }
