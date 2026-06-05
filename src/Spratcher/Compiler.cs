@@ -38,6 +38,7 @@ namespace IL2LLVM.Compiler
 
         private Stack<LLVMObject> analyticalStack = new();
         private LLVMObject[]? localVars;
+        private string[]? localVarTypes;
         private string[]? argTypes; // Names will always be %arg0, %arg1
         private uint tempRegisterCounter = 0;
         private uint stringCounter = 0;
@@ -46,10 +47,13 @@ namespace IL2LLVM.Compiler
         private bool nextIsVolatile = false;
         private bool bundleCorelib = false;
         private Dictionary<Instruction, string>? instructionLabels;
+        private List<ushort> addressedLocals;
         private List<string>? declareLabels;
         private List<string>? calledCctors;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
         private readonly List<string> allCctors;
+        
+
 
         public Spratcher(ModuleDefinition module, byte ptrWidth, bool bundleCorelib = false, bool unicodeStrings = true)
         {
@@ -61,15 +65,18 @@ namespace IL2LLVM.Compiler
             declareLabels = new List<string>();
             calledCctors = new List<string>();
             allCctors = new List<string>();
+            addressedLocals = new List<ushort>();
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
         private LLVMObject[] LocalVars => localVars ?? throw new InvalidOperationException("Local variables not initialized.");
+        private string[] LocalVarTypes => localVarTypes ?? throw new InvalidOperationException("Local variable types not initialized.");
         private string[] ArgTypes => argTypes ?? throw new InvalidOperationException("Argument types not initialized.");
         private Dictionary<Instruction, string> InstructionLabels => instructionLabels ?? throw new InvalidOperationException("Instruction labels not initialized.");
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
         private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
         private List<string> AllCctors => allCctors ?? throw new InvalidOperationException("All CCTORs called not initialized.");
+        private List<ushort> AddressedLocals => addressedLocals ?? throw new InvalidOperationException("Addressed Locals not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -100,6 +107,23 @@ namespace IL2LLVM.Compiler
             Emitter.WriteLine($"    call void @_cctor_check(i32 {AllCctors.IndexOf(cctor)})");
 
             CalledCctors.Add(cctor);
+        }
+
+        private string CheckDeclaringForCCTors(TypeDefinition typeDef)
+        {
+            var cctorMethod = typeDef.Methods
+                .FirstOrDefault(m => m.Name == ".cctor");
+
+            if (cctorMethod != null)
+            {
+                string mangledCctorName = Mangler.Mangle(cctorMethod);
+                if (!AllCctors.Contains(mangledCctorName))
+                    AllCctors.Add(mangledCctorName);
+
+                return mangledCctorName;
+            }
+
+            return "";
         }
 
         private void GenerateCctorList()
@@ -217,12 +241,6 @@ namespace IL2LLVM.Compiler
             // Setup branch targets
             InitializeInstructionLabels([.. method.Body.Instructions]);
 
-            // Setup local vars
-            localVars = new LLVMObject[method.Body.Variables.Count];
-            for (int i = 0; i < method.Body.Variables.Count; i++)
-            {
-                LocalVars[i] = new($"%V_{i}", GetVarType(method.Body.Variables[i].VariableType), false);
-            }
 
             // Setup arg types
             argTypes = new string[method.Parameters.Count + (hasThis ? 1 : 0)];
@@ -259,8 +277,27 @@ namespace IL2LLVM.Compiler
             {
                 mangledName = GetEntryPoint(method)!;
             }
+
             else mangledName = Mangler.Mangle(method);
             Emitter.WriteLine($"define {returnType} @{mangledName}({string.Join(", ", ArgTypes.Select((t, i) => $"{t} %arg{i}"))}) {{");
+
+            PrefetchAddressedLocals([.. method.Body.Instructions]);
+
+            // Setup local vars
+            localVars = new LLVMObject[method.Body.Variables.Count];
+            localVarTypes = new string[method.Body.Variables.Count];
+            for (int i = 0; i < method.Body.Variables.Count; i++)
+            {
+                if (!IsAddressedLocal((ushort)method.Body.Variables[i].Index))
+                    continue; // No need to define smth not used
+
+                string localType = GetVarType(method.Body.Variables[i].VariableType);
+                LocalVarTypes[i] = localType;
+                Emitter.WriteLine($"    %V_{i} = alloca {localType}, align {GetAlignmentForType(localType)}");
+                LocalVars[i] = new($"%V_{i}", "ptr", false);
+            }
+
+            
 
             // Compile method body
             foreach (var instruction in method.Body.Instructions)
@@ -304,8 +341,23 @@ namespace IL2LLVM.Compiler
                     InstructionLabels.TryAdd(operand, $"IL_{operand.Offset:X4}");
                 }
             }
+        }
 
+        private void PrefetchAddressedLocals(Instruction[] instructions)
+        {
+            addressedLocals = new List<ushort>();
             
+            foreach (Instruction ins in instructions)
+            {
+                if (IsLoadLocalAddressInstruction(ins))
+                {
+                    if (!IsVariable(ins.Operand)) throw new InvalidOpcodeException("Invalid local operand!");
+
+                    var operand = (VariableDefinition)ins.Operand;
+
+                    AddressedLocals.Add((ushort)operand.Index);
+                }
+            }
         }
  
         private static bool IsBranchInstruction(Instruction ins)
@@ -317,7 +369,33 @@ namespace IL2LLVM.Compiler
                 _         => false
             };
         }
-        private static bool IsInstruction(object operand) => operand is Instruction;
+
+        private static bool IsLoadLocalInstruction(Instruction ins)
+        {
+            return ins.OpCode.Code switch
+            {
+                Code.Ldloc_0 => true,
+                Code.Ldloc_1 => true,
+                Code.Ldloc_2 => true,
+                Code.Ldloc_3 => true,
+                Code.Ldloc_S => true,
+                Code.Ldloc   => true,
+                _            => false
+            };
+        }
+
+        private static bool IsLoadLocalAddressInstruction(Instruction ins)
+        {
+            return ins.OpCode.Code switch
+            {
+                Code.Ldloca => true,
+                Code.Ldloca_S => true,
+                _            => false
+            };
+        }
+        private bool IsInstruction(object operand) => operand is Instruction;
+        private bool IsVariable(object operand) => operand is VariableDefinition;
+        private bool IsAddressedLocal(ushort index) => AddressedLocals.Contains(index); 
 
         private static string? GetNativeCallName(MethodDefinition method)
         {
@@ -347,7 +425,7 @@ namespace IL2LLVM.Compiler
 
             // ret name
             string? renameTo = (string?)attr.ConstructorArguments[0].Value;
-            return renameTo ?? "main";
+            return string.IsNullOrEmpty(renameTo) ? "main" : renameTo;
         }
 
         private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
@@ -390,10 +468,16 @@ namespace IL2LLVM.Compiler
                 [Code.Stloc_1]      = _ => STLOC(1),
                 [Code.Stloc_2]      = _ => STLOC(2),
                 [Code.Stloc_3]      = _ => STLOC(3),
-                [Code.Ldarg_S]      = instruction => LDARG_S((byte)instruction.Operand),
-                [Code.Ldarga_S]     = instruction => LDARGA_S((byte)instruction.Operand),
-                [Code.Ldloc_S]      = instruction => LDLOC_S((byte)instruction.Operand),
-                [Code.Ldloca_S]     = instruction => LDLOCA_S((byte)instruction.Operand),
+                [Code.Ldarg_S]      = instruction => LDARG((ushort)instruction.Operand),
+                [Code.Ldarga_S]     = instruction => LDARGA((VariableDefinition)instruction.Operand),
+                [Code.Ldloc_S]      = instruction => LDLOC((ushort)instruction.Operand),
+                [Code.Ldloca_S]     = instruction => LDLOCA((VariableDefinition)instruction.Operand),
+                [Code.Ldarg]        = instruction => LDARG((ushort)instruction.Operand),
+                [Code.Ldarga]       = instruction => LDARGA((VariableDefinition)instruction.Operand),
+                [Code.Ldloc]        = instruction => LDLOC((ushort)instruction.Operand),
+                [Code.Ldloca]       = instruction => LDLOCA((VariableDefinition)instruction.Operand),
+                [Code.Stloc]        = instruction => STLOC((ushort)instruction.Operand),
+                [Code.Stloc_S]      = instruction => STLOC((ushort)instruction.Operand),
                 [Code.Ldnull]       = _ => LDNULL(),
                 [Code.Ldc_I4_M1]    = _ => LDC_I4(-1),
                 [Code.Ldc_I4_0]     = _ => LDC_I4(0),
@@ -424,7 +508,9 @@ namespace IL2LLVM.Compiler
                 [Code.Ldstr]        = instruction => LDSTR((string)instruction.Operand),
                 [Code.Conv_U]       = _ => CONV_U(),
                 [Code.Conv_U8]      = _ => CONV_U8(),
-                [Code.Conv_I8]      = _ => CONV_I8()
+                [Code.Conv_I8]      = _ => CONV_I8(),
+                [Code.Stind_I8]     = _ => STIND_I8(),
+                [Code.Ldind_I8]     = _ => LDIND_I8(),
             };
         }
 
@@ -516,39 +602,46 @@ namespace IL2LLVM.Compiler
             Emitter.WriteLine("    call void @llvm.debugtrap()");
         }
 
-        void LDARG(byte index)
+        void LDARG(ushort index)
         {
             Push(new($"%arg{index}", ArgTypes[index], false));
         }
 
-        void LDLOC(byte index)
+        void LDLOC(ushort index)
         {
-            Push(LocalVars[index]);
+            if (!IsAddressedLocal(index))
+            {
+                Push(LocalVars[index]);
+                return;
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load {LocalVarTypes[index]}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
+            Push(new(tempReg, LocalVarTypes[index], false));
         }
 
-        void STLOC(byte index)
+        void STLOC(ushort index)
         {
-            LocalVars[index] = Pop();
+            if (!IsAddressedLocal(index))
+            {
+                LocalVars[index] = Pop();
+                return;
+            }
+            LLVMObject value = Pop();
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} {value.Type} {value.Value}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
+            nextIsVolatile = false;
         }
 
-        void LDARG_S(byte index)
+        void LDARGA(VariableDefinition index)
         {
-            LDARG(index);
+            Push(new($"%arg{index.Index}", "ptr", false));
         }
 
-        void LDARGA_S(byte index)
+        void LDLOCA(VariableDefinition index)
         {
-            Push(new($"%arg{index}", "ptr", false));
-        }
-
-        void LDLOC_S(byte index)
-        {
-            Push(LocalVars[index]);
-        }
-
-        void LDLOCA_S(byte index)
-        {
-            Push(new($"%V_{index}", "ptr", false));
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = getelementptr inbounds {LocalVarTypes[index.Index]}, ptr {LocalVars[index.Index].Value}, i64 0");
+            Push(new(tempReg, "ptr", false));
         }
 
         void LDNULL()
@@ -596,7 +689,13 @@ namespace IL2LLVM.Compiler
         { 
             if (!method.HasThis)
             {
-                var typeDef = method.DeclaringType.Resolve();
+                TypeDefinition? typeDef = null;
+                try
+                {
+                    typeDef = method.DeclaringType.Resolve();
+                }
+                catch {} // Cant resolve
+
                 if (typeDef != null)
                 {
                     // See if CCTOR is called
@@ -606,12 +705,8 @@ namespace IL2LLVM.Compiler
                     if (cctorMethod != null)
                         CallCctorIfNeeded(Mangler.Mangle(cctorMethod));
                 }
-                else
-                    throw new TypeLoadException(
-                        $"[ERROR] Fatal: Cannot resolve declaring type '{method.DeclaringType.FullName}'. " +
-                        $"The assembly containing this type is missing from Mono.Cecil's search paths. " +
-                        $"Cannot locate or invoke its '.cctor'."
-                    );
+                
+                // Cant resolve
             }
             // Assume name is mangled so we can mangle and call it directly
             string mangledName = Mangler.Mangle(method);
@@ -1048,6 +1143,61 @@ namespace IL2LLVM.Compiler
                 Console.WriteLine($"FATAL: Invalid type for conv.u: {obj.Type}");
                 Environment.Exit(-1);
             }
+        }
+
+        void STIND_I8()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.i8: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type == "i32")
+            {
+                // If constant, we can just convert it here
+                if (!value.Value.StartsWith('%'))
+                {
+                    int val = int.Parse(value.Value);
+                    value = new(((long)val).ToString(), "i64", false);
+                }
+                else
+                {
+                    string tempReg = $"%t_{tempRegisterCounter++}";
+                    Emitter.WriteLine($"    {tempReg} = sext i32 {value.Value} to i64");
+                    value = new(tempReg, "i64", false);
+                }
+            }
+            else if (value.Type == "i64")
+            {
+                // Do nothing
+            }
+            else
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.i8: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i64 {value.Value}, ptr {address.Value}, align 8");
+            nextIsVolatile = false;
+        }
+
+        void LDIND_I8()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.i8: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i64, ptr {address.Value}, align 8");
+            Push(new(tempReg, "i64", false));
         }
     }
 }
