@@ -844,11 +844,11 @@ namespace IL2LLVM.Compiler
         {
 
             // See if CCTOR is called
-            var cctorName = field.DeclaringType.Methods
-                .FirstOrDefault(m => m.FullName.Contains("cctor"));
+            var cctorMethod = field.DeclaringType.Methods
+                .FirstOrDefault(m => m.Name == ".cctor");
 
-            if (cctorName != null)
-                CallCctorIfNeeded(Mangler.Mangle(cctorName));
+            if (cctorMethod != null)
+                CallCctorIfNeeded(Mangler.Mangle(cctorMethod));
 
             string fieldName = Mangler.Mangle(field);
             LLVMObject value = Pop();
