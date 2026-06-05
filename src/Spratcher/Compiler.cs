@@ -47,6 +47,7 @@ namespace IL2LLVM.Compiler
         private bool bundleCorelib = false;
         private Dictionary<Instruction, string>? instructionLabels;
         private List<string>? declareLabels;
+        private List<string>? calledCctors;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
 
         public Spratcher(ModuleDefinition module, byte ptrWidth, bool bundleCorelib = false, bool unicodeStrings = true)
@@ -57,6 +58,7 @@ namespace IL2LLVM.Compiler
             this.unicodeStrings = unicodeStrings;
             instructionHandlers = BuildInstructionHandlers();
             declareLabels = new List<string>();
+            calledCctors = new List<string>();
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
