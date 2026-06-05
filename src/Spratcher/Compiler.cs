@@ -568,11 +568,11 @@ namespace IL2LLVM.Compiler
                 if (typeDef != null)
                 {
                     // See if CCTOR is called
-                    var cctorName = typeDef.Methods
-                        .FirstOrDefault(m => m.FullName.Contains("cctor"));
+                    var cctorMethod = typeDef.Methods
+                        .FirstOrDefault(m => m.Name == ".cctor");
 
-                    if (cctorName != null)
-                        CallCctorIfNeeded(Mangler.Mangle(cctorName));
+                    if (cctorMethod != null)
+                        CallCctorIfNeeded(Mangler.Mangle(cctorMethod));
                 }
                 else
                     throw new TypeLoadException(
