@@ -1,4 +1,3 @@
-using System;
 using IL2LLVM.Attributes;
 
 namespace ILTest;
