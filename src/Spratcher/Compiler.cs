@@ -49,6 +49,7 @@ namespace IL2LLVM.Compiler
         private List<string>? declareLabels;
         private List<string>? calledCctors;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
+        private readonly List<string> allCctors;
 
         public Spratcher(ModuleDefinition module, byte ptrWidth, bool bundleCorelib = false, bool unicodeStrings = true)
         {
@@ -59,6 +60,7 @@ namespace IL2LLVM.Compiler
             instructionHandlers = BuildInstructionHandlers();
             declareLabels = new List<string>();
             calledCctors = new List<string>();
+            allCctors = new List<string>();
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
@@ -67,6 +69,7 @@ namespace IL2LLVM.Compiler
         private Dictionary<Instruction, string> InstructionLabels => instructionLabels ?? throw new InvalidOperationException("Instruction labels not initialized.");
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
         private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
+        private List<string> AllCctors => allCctors ?? throw new InvalidOperationException("All CCTORs called not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -91,9 +94,36 @@ namespace IL2LLVM.Compiler
             if (CalledCctors.Contains(cctor))
                 return; // Already initialized
             
-            Emitter.WriteLine($"    call void @{cctor}()");
+            if (!AllCctors.Contains(cctor))
+                AllCctors.Add(cctor);
+            
+            Emitter.WriteLine($"    call void @_cctor_check(i32 {AllCctors.IndexOf(cctor)})");
 
             CalledCctors.Add(cctor);
+        }
+
+        private void GenerateCctorList()
+        {
+            if (AllCctors.Count == 0) return; // None
+
+            Emitter.WriteLine($"@_cctor_array = constant [{AllCctors.Count} x ptr] [{string.Join(", ", AllCctors.Select(n => $"ptr @{n}"))}], align 16");
+            Emitter.WriteLine($"@_cctor_array_bool = global [{AllCctors.Count} x i1]  [{string.Join(", ", AllCctors.Select(n => $"i1 0"))}], align 1");
+            Emitter.WriteLine("define void @_cctor_check(i32 %a) {");
+            Emitter.WriteLine("b:");
+            Emitter.WriteLine($"  %c = zext i32 %a to i64");
+            Emitter.WriteLine($"  %d = getelementptr inbounds [{AllCctors.Count} x i1], ptr @_cctor_array_bool, i64 0, i64 %c");
+            Emitter.WriteLine("  %e = load i1, ptr %d, align 1");
+            Emitter.WriteLine("  br i1 %e, label %f, label %g");
+            Emitter.WriteLine("g:");
+            Emitter.WriteLine("  store i1 1, ptr %d, align 1");
+            Emitter.WriteLine($"  %h = getelementptr inbounds [{AllCctors.Count} x ptr], ptr @_cctor_array, i64 0, i64 %c");
+            Emitter.WriteLine("  %i = load ptr, ptr %h, align 8");
+            Emitter.WriteLine("  call void %i()");
+            Emitter.WriteLine("  br label %f");
+            Emitter.WriteLine("f:");
+            Emitter.WriteLine("  ret void");
+            Emitter.WriteLine("}");
+
         }
 
         public void Run(string outFile)
@@ -159,6 +189,7 @@ namespace IL2LLVM.Compiler
 
                     EmitDeclareLabels();
                     EmitCorelibIfNeeded();
+                    GenerateCctorList();
                     Emitter.Flush();
                 }
 
@@ -179,6 +210,7 @@ namespace IL2LLVM.Compiler
             analyticalStack.Clear();
             tempRegisterCounter = 0;
             nextIsVolatile = false;
+            CalledCctors.Clear();
 
             bool hasThis = method.HasThis;
 
