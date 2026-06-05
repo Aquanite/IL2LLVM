@@ -1,16 +1,34 @@
-using System;
 using IL2LLVM.Attributes;
+
+namespace ILTest;
+
 public unsafe class Program
 {
-    private static readonly int STD_OUT = -11;
+    [EntryPoint]
     public static int Main()
     {
-        void* handle = GetHandle(STD_OUT);
-        WriteConsole(handle, "Hello from C# 🙂\n", 16, null, null);
-
+        string str = "Hello from C# 🙂\n";
+        ulong test = 0;
+        ulong* x = &test;
+        *x = 16;
+        Test.Write(str, *x);
         return 0;
     }
+}
 
+public static unsafe class Test
+{
+    private static readonly int STD_OUT = -11;
+
+    public static void Write(string str, ulong length)
+    {
+        void* handle = Native.GetHandle(STD_OUT);
+        Native.WriteConsole(handle, str, length, null, null);
+    }
+}
+
+public static unsafe class Native
+{
     [NativeCall("WriteConsoleW")]
     public static int WriteConsole(void* handle, string lpcwstr, ulong charsToWrite, ulong* charsWritten, void* reserved) 
         => throw new NotImplementedException();
