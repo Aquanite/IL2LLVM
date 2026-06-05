@@ -15,9 +15,9 @@ namespace IL2LLVM.Compiler
                 {
                     return "null";
                 }
-                else return field;
-            } 
-            set; 
+                return field;
+            }
+            set;
         }
         public string Type {get; set;}
         public bool isUnsigned {get; set;}
@@ -47,11 +47,31 @@ namespace IL2LLVM.Compiler
         private bool nextIsVolatile = false;
         private bool bundleCorelib = false;
         private Dictionary<Instruction, string>? instructionLabels;
-        private List<ushort> addressedLocals;
         private List<string>? declareLabels;
         private List<string>? calledCctors;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
         private readonly List<string> allCctors;
+        private string TargetNativeIntType
+        {
+            get
+            {
+                if (ptrWidth >= 8) return "i64";
+                if (ptrWidth >= 4) return "i32";
+                if (ptrWidth >= 2) return "i16";
+                return "i8";
+            }
+        }
+
+        private int TargetNativeIntTypeBits
+        {
+            get
+            {
+                if (ptrWidth >= 8) return 64;
+                if (ptrWidth >= 4) return 32;
+                if (ptrWidth >= 2) return 16;
+                return 8;
+            }
+        }
         
 
 
@@ -65,7 +85,6 @@ namespace IL2LLVM.Compiler
             declareLabels = new List<string>();
             calledCctors = new List<string>();
             allCctors = new List<string>();
-            addressedLocals = new List<ushort>();
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
@@ -76,7 +95,6 @@ namespace IL2LLVM.Compiler
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
         private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
         private List<string> AllCctors => allCctors ?? throw new InvalidOperationException("All CCTORs called not initialized.");
-        private List<ushort> AddressedLocals => addressedLocals ?? throw new InvalidOperationException("Addressed Locals not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -281,16 +299,11 @@ namespace IL2LLVM.Compiler
             else mangledName = Mangler.Mangle(method);
             Emitter.WriteLine($"define {returnType} @{mangledName}({string.Join(", ", ArgTypes.Select((t, i) => $"{t} %arg{i}"))}) {{");
 
-            PrefetchAddressedLocals([.. method.Body.Instructions]);
-
             // Setup local vars
             localVars = new LLVMObject[method.Body.Variables.Count];
             localVarTypes = new string[method.Body.Variables.Count];
             for (int i = 0; i < method.Body.Variables.Count; i++)
             {
-                if (!IsAddressedLocal((ushort)method.Body.Variables[i].Index))
-                    continue; // No need to define smth not used
-
                 string localType = GetVarType(method.Body.Variables[i].VariableType);
                 LocalVarTypes[i] = localType;
                 Emitter.WriteLine($"    %V_{i} = alloca {localType}, align {GetAlignmentForType(localType)}");
@@ -342,23 +355,6 @@ namespace IL2LLVM.Compiler
                 }
             }
         }
-
-        private void PrefetchAddressedLocals(Instruction[] instructions)
-        {
-            addressedLocals = new List<ushort>();
-            
-            foreach (Instruction ins in instructions)
-            {
-                if (IsLoadLocalAddressInstruction(ins))
-                {
-                    if (!IsVariable(ins.Operand)) throw new InvalidOpcodeException("Invalid local operand!");
-
-                    var operand = (VariableDefinition)ins.Operand;
-
-                    AddressedLocals.Add((ushort)operand.Index);
-                }
-            }
-        }
  
         private static bool IsBranchInstruction(Instruction ins)
         {
@@ -395,7 +391,6 @@ namespace IL2LLVM.Compiler
         }
         private bool IsInstruction(object operand) => operand is Instruction;
         private bool IsVariable(object operand) => operand is VariableDefinition;
-        private bool IsAddressedLocal(ushort index) => AddressedLocals.Contains(index); 
 
         private static string? GetNativeCallName(MethodDefinition method)
         {
@@ -470,14 +465,14 @@ namespace IL2LLVM.Compiler
                 [Code.Stloc_3]      = _ => STLOC(3),
                 [Code.Ldarg_S]      = instruction => LDARG((ushort)instruction.Operand),
                 [Code.Ldarga_S]     = instruction => LDARGA((VariableDefinition)instruction.Operand),
-                [Code.Ldloc_S]      = instruction => LDLOC((ushort)instruction.Operand),
+                [Code.Ldloc_S]      = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
                 [Code.Ldloca_S]     = instruction => LDLOCA((VariableDefinition)instruction.Operand),
                 [Code.Ldarg]        = instruction => LDARG((ushort)instruction.Operand),
                 [Code.Ldarga]       = instruction => LDARGA((VariableDefinition)instruction.Operand),
-                [Code.Ldloc]        = instruction => LDLOC((ushort)instruction.Operand),
+                [Code.Ldloc]        = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
                 [Code.Ldloca]       = instruction => LDLOCA((VariableDefinition)instruction.Operand),
-                [Code.Stloc]        = instruction => STLOC((ushort)instruction.Operand),
-                [Code.Stloc_S]      = instruction => STLOC((ushort)instruction.Operand),
+                [Code.Stloc]        = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
+                [Code.Stloc_S]      = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
                 [Code.Ldnull]       = _ => LDNULL(),
                 [Code.Ldc_I4_M1]    = _ => LDC_I4(-1),
                 [Code.Ldc_I4_0]     = _ => LDC_I4(0),
@@ -507,10 +502,36 @@ namespace IL2LLVM.Compiler
                 [Code.Br]           = instruction => BR(instruction.Operand),
                 [Code.Ldstr]        = instruction => LDSTR((string)instruction.Operand),
                 [Code.Conv_U]       = _ => CONV_U(),
+                [Code.Conv_I]       = _ => CONV_I(),
                 [Code.Conv_U8]      = _ => CONV_U8(),
                 [Code.Conv_I8]      = _ => CONV_I8(),
+                [Code.Conv_U4]      = _ => CONV_U4(),
+                [Code.Conv_I4]      = _ => CONV_I4(),
+                [Code.Conv_U2]      = _ => CONV_U2(),
+                [Code.Conv_I2]      = _ => CONV_I2(),
+                [Code.Conv_U1]      = _ => CONV_U1(),
+                [Code.Conv_I1]      = _ => CONV_I1(),
+                [Code.Conv_R4]      = _ => CONV_R4(),
+                [Code.Conv_R8]      = _ => CONV_R8(),
                 [Code.Stind_I8]     = _ => STIND_I8(),
+                [Code.Stind_I1]     = _ => STIND_I1(),
+                [Code.Stind_I2]     = _ => STIND_I2(),
+                [Code.Stind_I4]     = _ => STIND_I4(),
+                [Code.Stind_I]      = _ => STIND_I(),
+                [Code.Stind_R4]     = _ => STIND_R4(),
+                [Code.Stind_R8]     = _ => STIND_R8(),
                 [Code.Ldind_I8]     = _ => LDIND_I8(),
+                [Code.Ldind_I1]     = _ => LDIND_I1(),
+                [Code.Ldind_I2]     = _ => LDIND_I2(),
+                [Code.Ldind_I4]     = _ => LDIND_I4(),
+                [Code.Ldind_I]      = _ => LDIND_I(),
+                [Code.Ldind_R4]     = _ => LDIND_R4(),
+                [Code.Ldind_R8]     = _ => LDIND_R8(),
+                [Code.Ldind_U1]     = _ => LDIND_U1(),
+                [Code.Ldind_U2]     = _ => LDIND_U2(),
+                [Code.Ldind_U4]     = _ => LDIND_U4(),
+                [Code.Ldind_Ref]    = _ => LDIND_REF(),
+                [Code.Stind_Ref]    = _ => STIND_REF(),
             };
         }
 
@@ -609,12 +630,6 @@ namespace IL2LLVM.Compiler
 
         void LDLOC(ushort index)
         {
-            if (!IsAddressedLocal(index))
-            {
-                Push(LocalVars[index]);
-                return;
-            }
-
             string tempReg = $"%t_{tempRegisterCounter++}";
             Emitter.WriteLine($"    {tempReg} = load {LocalVarTypes[index]}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
             Push(new(tempReg, LocalVarTypes[index], false));
@@ -622,12 +637,8 @@ namespace IL2LLVM.Compiler
 
         void STLOC(ushort index)
         {
-            if (!IsAddressedLocal(index))
-            {
-                LocalVars[index] = Pop();
-                return;
-            }
             LLVMObject value = Pop();
+            value = ConvertValueToType(value, LocalVarTypes[index]);
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} {value.Type} {value.Value}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
             nextIsVolatile = false;
         }
@@ -694,24 +705,20 @@ namespace IL2LLVM.Compiler
                 {
                     typeDef = method.DeclaringType.Resolve();
                 }
-                catch {} // Cant resolve
+                catch {}
 
                 if (typeDef != null)
                 {
-                    // See if CCTOR is called
                     var cctorMethod = typeDef.Methods
                         .FirstOrDefault(m => m.Name == ".cctor");
 
                     if (cctorMethod != null)
                         CallCctorIfNeeded(Mangler.Mangle(cctorMethod));
                 }
-                
-                // Cant resolve
             }
-            // Assume name is mangled so we can mangle and call it directly
+            
             string mangledName = Mangler.Mangle(method);
 
-            // Get arg types
             string[] callArgTypes = new string[method.Parameters.Count + (method.HasThis ? 1 : 0)];
             if (method.HasThis)
             {
@@ -722,25 +729,45 @@ namespace IL2LLVM.Compiler
                 callArgTypes[i + (method.HasThis ? 1 : 0)] = GetVarType(method.Parameters[i].ParameterType);
             }
 
-            // Get return type
             string returnType = GetVarType(method.ReturnType);
 
-            // Pop args in reverse order
             LLVMObject[] args = new LLVMObject[callArgTypes.Length];
             for (int i = callArgTypes.Length - 1; i >= 0; i--)
             {
                 args[i] = Pop();
             }
 
-            // Emit call
+            var formattedArgs = callArgTypes.Select((t, i) => 
+            {
+                string val = args[i].Value;
+                string currentType = args[i].Type;
+
+                if (t == "ptr" && (val == "0" || string.IsNullOrEmpty(val)))
+                {
+                    return "ptr null";
+                }
+
+                // If function expects a pointer, but stack has an integer, cast it inline
+                if (t == "ptr" && currentType.StartsWith("i"))
+                {
+                    string castReg = $"%t_{tempRegisterCounter++}";
+                    Emitter.WriteLine($"    {castReg} = inttoptr {currentType} {val} to ptr");
+                    return $"ptr {castReg}";
+                }
+
+                return $"{t} {val}";
+            });
+
+            string argsString = string.Join(", ", formattedArgs);
+
             if (returnType == "void")
             {
-                Emitter.WriteLine($"    call void @{mangledName}({string.Join(", ", callArgTypes.Select((t, i) => $"{t} {args[i].Value}"))})");
+                Emitter.WriteLine($"    call void @{mangledName}({argsString})");
             }
             else
             {
                 string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = call {returnType} @{mangledName}({string.Join(", ", callArgTypes.Select((t, i) => $"{t} {args[i].Value}"))})");
+                Emitter.WriteLine($"    {tempReg} = call {returnType} @{mangledName}({argsString})");
                 Push(new(tempReg, returnType, false));
             }
         }
@@ -750,110 +777,19 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (!IsWorkableType(a.Type) || !IsWorkableType(b.Type))
-            {
-                // Check if B or A is a ptr
-                if      (a.Type == "ptr" && IsWorkableType(b.Type)) {}                  // Correct order, do nothing
-                else if (b.Type == "ptr" && IsWorkableType(a.Type)) (a, b) = (b, a);    // Swap so ptr is always A
-                else
-                {
-                    Console.WriteLine($"FATAL: Invalid types for ADD: {a.Type}, {b.Type}");
-                    Environment.Exit(-1);
-                }
-
-                if (b.Type != "i64" && b.Type != "i32") // CIL only allows ptr + i32/i64, so if its not one of those, then assume we have invalid CIL
-                {
-                    Console.WriteLine($"FATAL: Invalid non-integer type for pointer arithmetic: {b.Type}");
-                    Environment.Exit(-1);
-                }
-
-                string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = getelementptr inbounds i8, ptr {a.Value}, {b.Type} {b.Value}");
-                Push(new(tempReg, "ptr", false));
-
-                return;
-            }
-
-            // First check if both A and B are constants
-            if (a.Value[0] == '%' || b.Value[0] == '%')
+            if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
             {
                 string tempReg = $"%t_{tempRegisterCounter++}";
-
-                // Check if float
-                if (a.Type == "float" || a.Type == "double")
+                string llvmOp = a.Type switch
                 {
-                    Emitter.WriteLine($"    {tempReg} = fadd {a.Type} {a.Value}, {b.Value}");
-                    Push(new(tempReg, a.Type, false));
-                    return;
-                }
-
-                // If one is unsigned, the result is unsigned. Otherwise, its signed
-                bool isUnsigned = a.isUnsigned || b.isUnsigned;
-
-                Emitter.WriteLine($"    {tempReg} = add {a.Type} {a.Value}, {b.Type} {b.Value}");
-                Push(new(tempReg, a.Type, isUnsigned));
+                    "float" => "fadd",
+                    "double" => "fadd",
+                    _ => "add"
+                };
+                Emitter.WriteLine($"    {tempReg} = {llvmOp} {a.Type} {a.Value}, {b.Value}");
+                Push(new(tempReg, a.Type, false));
                 return;
             }
-
-            // We can do the math here
-            if (a.Type != b.Type)
-            {
-                Console.WriteLine($"FATAL: Type mismatch for ADD: {a.Type}, {b.Type}");
-                Environment.Exit(-1);
-            }
-
-            // Really only have 4 choices here, i32, i64, float, double. Knowing that i8+ gets wided, can just check for those 4 types and assume the rest is invalid CIL
-            string? resultTypeA = a.Type switch
-            {
-                "i32" => "i32",
-                "i64" => "i64",
-                "float" => "float",
-                "double" => "double",
-                _ => null
-            };
-
-            string? resultTypeB = b.Type switch
-            {
-                "i32" => "i32",
-                "i64" => "i64",
-                "float" => "float",
-                "double" => "double",
-                _ => null
-            };
-
-            if (resultTypeA == null || resultTypeB == null)
-            {
-                Console.WriteLine($"FATAL: Invalid types for ADD: {a.Type}, {b.Type}");
-                Environment.Exit(-1);
-            }
-
-            // Now we dont have to emit anything, and can just do the math here and push as constant
-            if (resultTypeA == "i32")
-            {
-                int valA = int.Parse(a.Value);
-                int valB = int.Parse(b.Value);
-                Push(new((valA + valB).ToString(), "i32", false));
-            }
-            else if (resultTypeA == "i64")
-            {
-                long valA = long.Parse(a.Value);
-                long valB = long.Parse(b.Value);
-                Push(new((valA + valB).ToString(), "i64", false));
-            }
-            else if (resultTypeA == "float")
-            {
-                float valA = float.Parse(a.Value);
-                float valB = float.Parse(b.Value);
-                Push(new((valA + valB).ToString("R"), "float", false));
-            }
-            else if (resultTypeA == "double")
-            {
-                double valA = double.Parse(a.Value);
-                double valB = double.Parse(b.Value);
-                Push(new((valA + valB).ToString("R"), "double", false));
-            }
-
-            return;
         }
 
         void SUB()
@@ -861,110 +797,19 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (!IsWorkableType(a.Type) || !IsWorkableType(b.Type))
-            {
-                // Check if B or A is a ptr
-                if      (a.Type == "ptr" && IsWorkableType(b.Type)) {}                  // Correct order, do nothing
-                else if (b.Type == "ptr" && IsWorkableType(a.Type)) (a, b) = (b, a);    // Swap so ptr is always A
-                else
-                {
-                    Console.WriteLine($"FATAL: Invalid types for SUB: {a.Type}, {b.Type}");
-                    Environment.Exit(-1);
-                }
-
-                if (b.Type != "i64" && b.Type != "i32") // CIL only allows ptr + i32/i64, so if its not one of those, then assume we have invalid CIL
-                {
-                    Console.WriteLine($"FATAL: Invalid non-integer type for pointer arithmetic: {b.Type}");
-                    Environment.Exit(-1);
-                }
-
-                string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = getelementptr inbounds i8, ptr {a.Value}, {b.Type} {b.Value}");
-                Push(new(tempReg, "ptr", false));
-
-                return;
-            }
-
-            // First check if both A and B are constants
-            if (a.Value[0] == '%' || b.Value[0] == '%')
+            if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
             {
                 string tempReg = $"%t_{tempRegisterCounter++}";
-
-                // Check if float
-                if (a.Type == "float" || a.Type == "double")
+                string llvmOp = a.Type switch
                 {
-                    Emitter.WriteLine($"    {tempReg} = fsub {a.Type} {a.Value}, {b.Value}");
-                    Push(new(tempReg, a.Type, false));
-                    return;
-                }
-
-                // If one is unsigned, the result is unsigned. Otherwise, its signed
-                bool isUnsigned = a.isUnsigned || b.isUnsigned;
-
-                Emitter.WriteLine($"    {tempReg} = sub {a.Type} {a.Value}, {b.Type} {b.Value}");
-                Push(new(tempReg, a.Type, isUnsigned));
+                    "float" => "fsub",
+                    "double" => "fsub",
+                    _ => "sub"
+                };
+                Emitter.WriteLine($"    {tempReg} = {llvmOp} {a.Type} {a.Value}, {b.Value}");
+                Push(new(tempReg, a.Type, false));
                 return;
             }
-
-            // We can do the math here
-            if (a.Type != b.Type)
-            {
-                Console.WriteLine($"FATAL: Type mismatch for SUB: {a.Type}, {b.Type}");
-                Environment.Exit(-1);
-            }
-
-            // Really only have 4 choices here, i32, i64, float, double. Knowing that i8+ gets wided, can just check for those 4 types and assume the rest is invalid CIL
-            string? resultTypeA = a.Type switch
-            {
-                "i32" => "i32",
-                "i64" => "i64",
-                "float" => "float",
-                "double" => "double",
-                _ => null
-            };
-
-            string? resultTypeB = b.Type switch
-            {
-                "i32" => "i32",
-                "i64" => "i64",
-                "float" => "float",
-                "double" => "double",
-                _ => null
-            };
-
-            if (resultTypeA == null || resultTypeB == null)
-            {
-                Console.WriteLine($"FATAL: Invalid types for SUB: {a.Type}, {b.Type}");
-                Environment.Exit(-1);
-            }
-
-            // Now we dont have to emit anything, and can just do the math here and push as constant
-            if (resultTypeA == "i32")
-            {
-                int valA = int.Parse(a.Value);
-                int valB = int.Parse(b.Value);
-                Push(new((valA - valB).ToString(), "i32", false));
-            }
-            else if (resultTypeA == "i64")
-            {
-                long valA = long.Parse(a.Value);
-                long valB = long.Parse(b.Value);
-                Push(new((valA - valB).ToString(), "i64", false));
-            }
-            else if (resultTypeA == "float")
-            {
-                float valA = float.Parse(a.Value);
-                float valB = float.Parse(b.Value);
-                Push(new((valA - valB).ToString("R"), "float", false));
-            }
-            else if (resultTypeA == "double")
-            {
-                double valA = double.Parse(a.Value);
-                double valB = double.Parse(b.Value);
-                Push(new((valA - valB).ToString("R"), "double", false));
-            }
-
-            return;
         }
 
         void STSFLD(FieldDefinition field)
@@ -979,6 +824,7 @@ namespace IL2LLVM.Compiler
 
             string fieldName = Mangler.Mangle(field);
             LLVMObject value = Pop();
+            value = ConvertValueToType(value, GetVarType(field.FieldType));
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} {value.Type} {value.Value}, ptr @{fieldName}, align {GetAlignmentForType(value.Type)}");
 
             nextIsVolatile = false;
@@ -1047,102 +893,158 @@ namespace IL2LLVM.Compiler
             Push(new(tempReg, "ptr", false));
         }
 
-        void CONV_U8()
+        void CONV_R4()
         {
-            LLVMObject obj = Pop();
-            if (obj.Type == "i32")
+            LLVMObject value = Pop();
+            if (value.Type == "float") { Push(value); return; }
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            string llvmOp = value.Type switch
             {
-                // If constant, we can just convert it here and push as i64 constant
-                if (!obj.Value.StartsWith('%'))
-                {
-                    int val = int.Parse(obj.Value);
-                    Push(new(((ulong)val).ToString(), "i64", true));
-                    return;
-                }
-
-                string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = zext i32 {obj.Value} to i64");
-                Push(new(tempReg, "i64", true));
-            }
-            else if (obj.Type == "i64")
-            {
-                Push(new(obj.Value, "i64", true));
-            }
-            else
-            {
-                Console.WriteLine($"FATAL: Invalid type for conv.u8: {obj.Type}");
-                Environment.Exit(-1);
-            }
+                "double" => "fptrunc",
+                _ => value.isUnsigned ? "uitofp" : "sitofp"
+            };
+            Emitter.WriteLine($"    {tempReg} = {llvmOp} {value.Type} {value.Value} to float");
+            Push(new(tempReg, "float", false));
         }
 
-        void CONV_I8()
+        void CONV_R8()
         {
-            LLVMObject obj = Pop();
-            if (obj.Type == "i32")
+            LLVMObject value = Pop();
+            if (value.Type == "double") { Push(value); return; }
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            string llvmOp = value.Type switch
             {
-                // If constant, we can just convert it here and push as i64 constant
-                if (!obj.Value.StartsWith('%'))
-                {
-                    int val = int.Parse(obj.Value);
-                    Push(new(((long)val).ToString(), "i64", false));
-                    return;
-                }
-
-                string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = sext i32 {obj.Value} to i64");
-                Push(new(tempReg, "i64", false));
-            }
-            else if (obj.Type == "i64")
-            {
-                Push(new(obj.Value, "i64", false));
-            }
-            else
-            {
-                Console.WriteLine($"FATAL: Invalid type for conv.i8: {obj.Type}");
-                Environment.Exit(-1);
-            }
+                "float" => "fpext",
+                _ => value.isUnsigned ? "uitofp" : "sitofp"
+            };
+            Emitter.WriteLine($"    {tempReg} = {llvmOp} {value.Type} {value.Value} to double");
+            Push(new(tempReg, "double", false));
         }
+
+        void EmitIntegerConv(string targetType, int targetWidth, bool targetUnsigned)
+        {
+            LLVMObject value = Pop();
+            if (value.Type == targetType) { Push(new(value.Value, targetType, targetUnsigned)); return; }
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            if (value.Type == "ptr")
+            {
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, targetUnsigned));
+                return;
+            }
+            if (value.Type == "float" || value.Type == "double")
+            {
+                string fpOp = targetUnsigned ? "fptoui" : "fptosi";
+                Emitter.WriteLine($"    {tempReg} = {fpOp} {value.Type} {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, targetUnsigned));
+                return;
+            }
+            int sourceWidth = int.Parse(value.Type[1..]);
+            string llvmOp = sourceWidth > targetWidth ? "trunc" : (value.isUnsigned ? "zext" : "sext");
+            Emitter.WriteLine($"    {tempReg} = {llvmOp} {value.Type} {value.Value} to {targetType}");
+            Push(new(tempReg, targetType, targetUnsigned));
+        }
+
+        void CONV_U1() => EmitIntegerConv("i8", 8, true);
+        void CONV_I1() => EmitIntegerConv("i8", 8, false);
+        void CONV_U2() => EmitIntegerConv("i16", 16, true);
+        void CONV_I2() => EmitIntegerConv("i16", 16, false);
+        void CONV_U4() => EmitIntegerConv("i32", 32, true);
+        void CONV_I4() => EmitIntegerConv("i32", 32, false);
+        void CONV_U8() => EmitIntegerConv("i64", 64, true);
+        void CONV_I8() => EmitIntegerConv("i64", 64, false);
 
         void CONV_U()
         {
-            LLVMObject obj = Pop();
-            if (obj.Type == "i32")
+            LLVMObject value = Pop();
+            string targetType = $"i{ptrWidth * 8}";
+            if (value.Type == "ptr")
             {
-                // If constant, we can just convert it here and push as ptr constant
-                if (!obj.Value.StartsWith('%'))
-                {
-                    int val = int.Parse(obj.Value);
-                    Push(new(((ulong)val).ToString(), "ptr", true));
-                    return;
-                }
-
                 string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = zext i32 {obj.Value} to ptr");
-                Push(new(tempReg, "ptr", true));
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, true));
+                return;
             }
-            else if (obj.Type == "i64")
-            {
-                // If constant, we can just convert it here and push as ptr constant
-                if (!obj.Value.StartsWith('%'))
-                {
-                    long val = long.Parse(obj.Value);
-                    Push(new(((ulong)val).ToString(), "ptr", true));
-                    return;
-                }
+            Push(value);
+            EmitIntegerConv(targetType, ptrWidth * 8, true);
+        }
 
+        void CONV_I()
+        {
+            LLVMObject value = Pop();
+            string targetType = $"i{ptrWidth * 8}";
+            if (value.Type == "ptr")
+            {
                 string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = zext i64 {obj.Value} to ptr");
-                Push(new(tempReg, "ptr", true));
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, false));
+                return;
             }
-            else if (obj.Type == "ptr")
+            Push(value);
+            EmitIntegerConv(targetType, ptrWidth * 8, false);
+        }
+
+        void STIND_I1()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
             {
-                Push(new(obj.Value, "ptr", true));
-            }
-            else
-            {
-                Console.WriteLine($"FATAL: Invalid type for conv.u: {obj.Type}");
+                Console.WriteLine($"FATAL: Invalid address type for stind.i1: {address.Type} [value type: {value.Type}]");
                 Environment.Exit(-1);
             }
+
+            if (value.Type != "i1")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.i1: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i1 {value.Value}, ptr {address.Value}, align 1");
+            nextIsVolatile = false;
+        }
+
+        void STIND_I2()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.i2: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type != "i16")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.i2: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i16 {value.Value}, ptr {address.Value}, align 2");
+            nextIsVolatile = false;
+        }
+
+        void STIND_I4()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.i4: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type != "i32")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.i4: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i32 {value.Value}, ptr {address.Value}, align 4");
+            nextIsVolatile = false;
         }
 
         void STIND_I8()
@@ -1152,36 +1054,81 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for stind.i8: {address.Type}");
+                Console.WriteLine($"FATAL: Invalid address type for stind.i8: {address.Type} [value type: {value.Type}]");
                 Environment.Exit(-1);
             }
 
-            if (value.Type == "i32")
-            {
-                // If constant, we can just convert it here
-                if (!value.Value.StartsWith('%'))
-                {
-                    int val = int.Parse(value.Value);
-                    value = new(((long)val).ToString(), "i64", false);
-                }
-                else
-                {
-                    string tempReg = $"%t_{tempRegisterCounter++}";
-                    Emitter.WriteLine($"    {tempReg} = sext i32 {value.Value} to i64");
-                    value = new(tempReg, "i64", false);
-                }
-            }
-            else if (value.Type == "i64")
-            {
-                // Do nothing
-            }
-            else
+            if (value.Type != "i64")
             {
                 Console.WriteLine($"FATAL: Invalid value type for stind.i8: {value.Type}");
                 Environment.Exit(-1);
             }
 
+
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i64 {value.Value}, ptr {address.Value}, align 8");
+            nextIsVolatile = false;
+        }
+
+        void STIND_R4()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.r4: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type != "float")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.r4: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} float {value.Value}, ptr {address.Value}, align 4");
+            nextIsVolatile = false;
+        }
+
+        void STIND_R8()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.r8: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type != "double")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.r8: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} double {value.Value}, ptr {address.Value}, align 8");
+            nextIsVolatile = false;
+        }
+
+        void STIND_I()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.i: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (!value.Type.StartsWith("i"))
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.i: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} {value.Type} {value.Value}, ptr {address.Value}, align {GetAlignmentForType(value.Type)}");
             nextIsVolatile = false;
         }
 
@@ -1198,6 +1145,242 @@ namespace IL2LLVM.Compiler
             string tempReg = $"%t_{tempRegisterCounter++}";
             Emitter.WriteLine($"    {tempReg} = load i64, ptr {address.Value}, align 8");
             Push(new(tempReg, "i64", false));
+        }
+
+        void LDIND_I1()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.i1: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i1, ptr {address.Value}, align 1");
+            Push(new(tempReg, "i1", false));
+        }
+
+        void LDIND_I2()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.i2: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i16, ptr {address.Value}, align 2");
+            Push(new(tempReg, "i16", false));
+        }
+
+        void LDIND_I4()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.i4: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i32, ptr {address.Value}, align 4");
+            Push(new(tempReg, "i32", false));
+        }
+
+        void LDIND_I()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.i: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i64, ptr {address.Value}, align 8");
+            Push(new(tempReg, "i64", false));
+        }
+
+        void LDIND_R4()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.r4: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load float, ptr {address.Value}, align 4");
+            Push(new(tempReg, "float", false));
+        }
+
+        void LDIND_R8()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.r8: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load double, ptr {address.Value}, align 8");
+            Push(new(tempReg, "double", false));
+        }
+
+        void LDIND_U1()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.u1: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i8, ptr {address.Value}, align 1");
+            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg2} = zext i8 {tempReg} to i32");
+            Push(new(tempReg2, "i32", true));
+        }
+
+        void LDIND_U2()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.u2: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i16, ptr {address.Value}, align 2");
+            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg2} = zext i16 {tempReg} to i32");
+            Push(new(tempReg2, "i32", true));
+        }
+
+        void LDIND_U4()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.u4: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load i32, ptr {address.Value}, align 4");
+            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg2} = zext i32 {tempReg} to i64");
+            Push(new(tempReg2, "i64", true));
+        }
+        
+        void LDIND_REF()
+        {
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for ldind.ref: {address.Type}");
+                Environment.Exit(-1);
+            }
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+            Emitter.WriteLine($"    {tempReg} = load ptr, ptr {address.Value}, align {ptrWidth}");
+            Push(new(tempReg, "ptr", false));
+        }
+
+        void STIND_REF()
+        {
+            LLVMObject value = Pop();
+            LLVMObject address = Pop();
+
+            if (address.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid address type for stind.ref: {address.Type} [value type: {value.Type}]");
+                Environment.Exit(-1);
+            }
+
+            if (value.Type != "ptr")
+            {
+                Console.WriteLine($"FATAL: Invalid value type for stind.ref: {value.Type}");
+                Environment.Exit(-1);
+            }
+
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} ptr {value.Value}, ptr {address.Value}, align {ptrWidth}");
+            nextIsVolatile = false;
+        }
+
+        LLVMObject ConvertValueToType(LLVMObject value, string targetType)
+        {
+            if (value.Type == targetType)
+                return value;
+
+            string tempReg = $"%t_{tempRegisterCounter++}";
+
+            if (targetType == "ptr")
+            {
+                if (value.Type.StartsWith("i"))
+                {
+                    Emitter.WriteLine($"    {tempReg} = inttoptr {value.Type} {value.Value} to ptr");
+                    return new(tempReg, "ptr", false);
+                }
+
+                if (value.Type == "null")
+                    return new("null", "ptr", false);
+            }
+
+            if (value.Type == "ptr" && targetType.StartsWith("i"))
+            {
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
+                return new(tempReg, targetType, true);
+            }
+
+            if (targetType == "float" || targetType == "double")
+            {
+                if (value.Type == "float" && targetType == "double")
+                {
+                    Emitter.WriteLine($"    {tempReg} = fpext float {value.Value} to double");
+                    return new(tempReg, "double", false);
+                }
+
+                if (value.Type == "double" && targetType == "float")
+                {
+                    Emitter.WriteLine($"    {tempReg} = fptrunc double {value.Value} to float");
+                    return new(tempReg, "float", false);
+                }
+
+                if (value.Type.StartsWith("i"))
+                {
+                    string fpOp = value.isUnsigned ? "uitofp" : "sitofp";
+                    Emitter.WriteLine($"    {tempReg} = {fpOp} {value.Type} {value.Value} to {targetType}");
+                    return new(tempReg, targetType, false);
+                }
+            }
+
+            if (targetType.StartsWith("i") && value.Type.StartsWith("i"))
+            {
+                int targetWidth = int.Parse(targetType[1..]);
+                int sourceWidth = int.Parse(value.Type[1..]);
+                string llvmOp = sourceWidth > targetWidth ? "trunc" : (value.isUnsigned ? "zext" : "sext");
+                Emitter.WriteLine($"    {tempReg} = {llvmOp} {value.Type} {value.Value} to {targetType}");
+                return new(tempReg, targetType, targetType == "i1" ? false : value.isUnsigned);
+            }
+
+            throw new NotSupportedException($"Cannot convert value type {value.Type} to {targetType}");
         }
     }
 }
