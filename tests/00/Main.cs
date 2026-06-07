@@ -7,7 +7,7 @@ public class Program
     [EntryPoint]
     public static int Main()
     {
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; 5 > i; i++)
         {
             Test.Write("Hello, world!\n", 14);       
         }

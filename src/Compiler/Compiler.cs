@@ -424,9 +424,8 @@ namespace IL2LLVM.Compiler
 
         private static string? GetNativeCallName(MethodReference methodref)
         {
-            if (methodref is MethodDefinition)
+            if (methodref is MethodDefinition method)
             {
-                MethodDefinition method = (MethodDefinition)methodref;
                 // Is it a native call?
                 var attr = method.CustomAttributes.FirstOrDefault(a =>
                     a.AttributeType.FullName == "IL2LLVM.Attributes.NativeCall");
@@ -465,21 +464,14 @@ namespace IL2LLVM.Compiler
 
         private static string ToLLVMUnicodeString(string str)
         {
-            byte[] utf16Bytes = System.Text.Encoding.Unicode.GetBytes(str);
+            byte[] utf16Bytes = Encoding.Unicode.GetBytes(str);
             return string.Concat(utf16Bytes.Select(b => $"\\{b:X2}")) + "\\00\\00";
         }
 
         private static string ToLLVMAsciiString(string str)
         {
-            string built = "";
             byte[] str_bytes = Encoding.ASCII.GetBytes(str);
-
-            foreach (byte c in str_bytes)
-            {
-                built += $"\\{c:X2}";
-            }
-
-            return built + "\\00";
+            return string.Concat(str_bytes.Select(b => $"\\{b:X2}")) + "\\00";
         }
 
         private Dictionary<Code, Action<Instruction>> BuildInstructionHandlers()
@@ -543,6 +535,7 @@ namespace IL2LLVM.Compiler
                 [Code.Brtrue_S]     = instruction => BRTRUE(instruction.Operand),
                 [Code.Ceq]          = _ => CEQ(),
                 [Code.Clt]          = _ => CLT(),
+                [Code.Cgt]          = _ => CGT(),
                 [Code.Ldstr]        = instruction => LDSTR((string)instruction.Operand),
                 [Code.Conv_U]       = _ => CONV_U(),
                 [Code.Conv_I]       = _ => CONV_I(),
@@ -1459,6 +1452,31 @@ namespace IL2LLVM.Compiler
 
             Compare cmp = new(
                 isFloat ? LLVMComparison.UnorderedLessThan : LLVMComparison.LessThan, 
+                a.Type,
+                a.Value, b.Value, tmp, 
+                isFloat
+            );
+
+            Emitter.WriteLine(cmp.Formulate());
+            Emitter.WriteLine(Extend.Formulate(false, "i1", tmp, "i32", res));
+
+            Push(new(res, "i32", false));
+        }
+
+        void CGT()
+        {
+            LLVMObject b = Pop();
+            LLVMObject a = Pop();
+
+            if (a.Type != b.Type)
+                throw new InvalidDataException($"CEQ invalid comparison: a={a.Type}, b={b.Type}");
+            
+            string tmp = TemporaryRegister();
+            string res = TemporaryRegister();
+            bool isFloat = IsFloat(a.Type);
+
+            Compare cmp = new(
+                isFloat ? LLVMComparison.UnorderedGreaterThan : LLVMComparison.GreaterThan, 
                 a.Type,
                 a.Value, b.Value, tmp, 
                 isFloat
