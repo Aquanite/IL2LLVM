@@ -2,16 +2,21 @@ using IL2LLVM.Attributes;
 
 namespace ILTest;
 
-public unsafe class Program
+public class Program
 {
     [EntryPoint]
     public static int Main()
     {
-        string str = "Hello from C# 🙂\n";
-        ulong test = 0;
-        ulong* x = &test;
-        *x = 16;
-        Test.Write(str, *x);
+        bool x = true;
+
+        if (x)
+        {
+            Test.Write("Hello, World!", 13);
+        }
+        else
+        {
+            Test.Write("Goodbye, World!", 15);
+        }
         return 0;
     }
 }

@@ -1,38 +1,16 @@
 using System.Collections.Frozen;
 using System.Reflection.PortableExecutable;
 using System.Text;
+using IL2LLVM.Formulae;
 using Microsoft.VisualBasic;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
 namespace IL2LLVM.Compiler
 {
-    public record LLVMObject
-    {
-        public string Value {
-            get {
-                if (field == "0" && Type == "ptr")
-                {
-                    return "null";
-                }
-                return field;
-            }
-            set;
-        }
-        public string Type {get; set;}
-        public bool isUnsigned {get; set;}
-
-        public LLVMObject(string value, string type, bool isunsigned)
-        {
-            Value = value;
-            Type = type;
-            isUnsigned = isunsigned;
-        }
-    }
 
     public class Spratcher
     {
-        
         private StreamWriter? emitter;
         private ModuleDefinition module;
 
@@ -41,16 +19,38 @@ namespace IL2LLVM.Compiler
         private string[]? localVarTypes;
         private string[]? argTypes; // Names will always be %arg0, %arg1
         private uint tempRegisterCounter = 0;
+        private uint tempBranchCounter = 0;
         private uint stringCounter = 0;
         private bool unicodeStrings = true;
         private byte ptrWidth = 8; // Assume 64-bit 
         private bool nextIsVolatile = false;
         private bool bundleCorelib = false;
+        private string targetDouble = "";
         private Dictionary<Instruction, string>? instructionLabels;
         private List<string>? declareLabels;
         private List<string>? calledCctors;
+        private MethodDefinition currentMethod;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
         private readonly List<string> allCctors;
+        private static Dictionary<string, string> targetMatch = new Dictionary<string, string>
+        {
+            ["i686-windows"]    = "i686-pc-windows-msvc",
+            ["i686-linux"]      = "i686-pc-linux-gnu",
+            ["i686-darwin"]     = "i386-apple-darwin",
+            ["i686-generic"]    = "i686-unknown-unknown",
+
+            ["x86_64-windows"]  = "x86_64-pc-windows-msvc",
+            ["x86_64-linux"]    = "x86_64-pc-linux-gnu",
+            ["x86_64-darwin"]   = "x86_64-apple-darwin",
+            ["x86_64-generic"]  = "x86_64-unknown-unknown",
+
+            ["aarch64-windows"] = "aarch64-pc-windows-msvc",
+            ["aarch64-linux"]   = "aarch64-linux-gnu",
+            ["aarch64-darwin"]  = "aarch64-apple-darwin",
+            ["aarch64-generic"] = "aarch64-unknown-unknown",
+
+            ["none-none"]       = ""
+        };
         private string TargetNativeIntType
         {
             get
@@ -72,19 +72,19 @@ namespace IL2LLVM.Compiler
                 return 8;
             }
         }
-        
 
-
-        public Spratcher(ModuleDefinition module, byte ptrWidth, bool bundleCorelib = false, bool unicodeStrings = true)
+        public Spratcher(ModuleDefinition module, byte ptrWidth, string targetDouble, bool bundleCorelib = false, bool unicodeStrings = true)
         {
             this.module = module;
             this.ptrWidth = ptrWidth;
             this.bundleCorelib = bundleCorelib;
             this.unicodeStrings = unicodeStrings;
+            this.targetDouble = targetDouble;
             instructionHandlers = BuildInstructionHandlers();
             declareLabels = new List<string>();
             calledCctors = new List<string>();
             allCctors = new List<string>();
+            currentMethod = null!; // Is okay because it's not used until it IS set
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
@@ -95,6 +95,8 @@ namespace IL2LLVM.Compiler
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
         private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
         private List<string> AllCctors => allCctors ?? throw new InvalidOperationException("All CCTORs called not initialized.");
+        private MethodDefinition CurrentMethod => currentMethod ?? throw new InvalidOperationException("Current Method not initialized.");
+        private Dictionary<string, string> TargetMatch => targetMatch ?? throw new InvalidOperationException("Target Match not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -116,56 +118,61 @@ namespace IL2LLVM.Compiler
 
         private void CallCctorIfNeeded(string cctor)
         {
+            if (Mangler.Mangle(CurrentMethod) == cctor)
+                return; // Don't want self calls
+
             if (CalledCctors.Contains(cctor))
                 return; // Already initialized
             
             if (!AllCctors.Contains(cctor))
                 AllCctors.Add(cctor);
             
-            Emitter.WriteLine($"    call void @_cctor_check(i32 {AllCctors.IndexOf(cctor)})");
+            Emitter.WriteLine(Call.Formulate("void", "_cctor_check", [$"i32 {AllCctors.IndexOf(cctor)}"]));
 
             CalledCctors.Add(cctor);
-        }
-
-        private string CheckDeclaringForCCTors(TypeDefinition typeDef)
-        {
-            var cctorMethod = typeDef.Methods
-                .FirstOrDefault(m => m.Name == ".cctor");
-
-            if (cctorMethod != null)
-            {
-                string mangledCctorName = Mangler.Mangle(cctorMethod);
-                if (!AllCctors.Contains(mangledCctorName))
-                    AllCctors.Add(mangledCctorName);
-
-                return mangledCctorName;
-            }
-
-            return "";
         }
 
         private void GenerateCctorList()
         {
             if (AllCctors.Count == 0) return; // None
 
-            Emitter.WriteLine($"@_cctor_array = constant [{AllCctors.Count} x ptr] [{string.Join(", ", AllCctors.Select(n => $"ptr @{n}"))}], align 16");
-            Emitter.WriteLine($"@_cctor_array_bool = global [{AllCctors.Count} x i1]  [{string.Join(", ", AllCctors.Select(n => $"i1 0"))}], align 1");
-            Emitter.WriteLine("define void @_cctor_check(i32 %a) {");
-            Emitter.WriteLine("b:");
-            Emitter.WriteLine($"  %c = zext i32 %a to i64");
-            Emitter.WriteLine($"  %d = getelementptr inbounds [{AllCctors.Count} x i1], ptr @_cctor_array_bool, i64 0, i64 %c");
-            Emitter.WriteLine("  %e = load i1, ptr %d, align 1");
-            Emitter.WriteLine("  br i1 %e, label %f, label %g");
-            Emitter.WriteLine("g:");
-            Emitter.WriteLine("  store i1 1, ptr %d, align 1");
-            Emitter.WriteLine($"  %h = getelementptr inbounds [{AllCctors.Count} x ptr], ptr @_cctor_array, i64 0, i64 %c");
-            Emitter.WriteLine("  %i = load ptr, ptr %h, align 8");
-            Emitter.WriteLine("  call void %i()");
-            Emitter.WriteLine("  br label %f");
-            Emitter.WriteLine("f:");
-            Emitter.WriteLine("  ret void");
-            Emitter.WriteLine("}");
+            Emitter.WriteLine($"@_cctor_init_array = constant [{AllCctors.Count} x ptr] [{string.Join(", ", AllCctors.Select(n => $"ptr @{n}"))}], align 16");
+            Emitter.WriteLine($"@_cctor_init_state = global [{AllCctors.Count} x i8]  [{string.Join(", ", AllCctors.Select(n => $"i8 0"))}], align 1");
 
+            Emitter.WriteLine("define void @_cctor_check(i32 %_cctor_init_a) {");
+
+            Emitter.WriteLine("_cctor_init_b:");
+            Emitter.WriteLine("    %_cctor_init_c = zext i32 %_cctor_init_a to i64");
+            Emitter.WriteLine($"    %_cctor_init_d = getelementptr inbounds [{AllCctors.Count} x i8], ptr @_cctor_init_state, i64 0, i64 %_cctor_init_c");
+            Emitter.WriteLine("    br label %_cctor_init_retry"); 
+
+            Emitter.WriteLine("_cctor_init_retry:");
+            Emitter.WriteLine("    %_cctor_init_old = load atomic i8, ptr %_cctor_init_d acquire, align 1");
+            Emitter.WriteLine("    %_cctor_init_is_done = icmp eq i8 %_cctor_init_old, 2");
+            Emitter.WriteLine("    br i1 %_cctor_init_is_done, label %_cctor_init_done, label %_cctor_init_check");
+
+            Emitter.WriteLine("_cctor_init_check:");
+            Emitter.WriteLine("    %_cctor_init_is_running = icmp eq i8 %_cctor_init_old, 1");
+            Emitter.WriteLine("    br i1 %_cctor_init_is_running, label %_cctor_init_spin, label %_cctor_init_try_claim");
+
+            Emitter.WriteLine("_cctor_init_try_claim:");
+            Emitter.WriteLine("    %_cctor_init_cmp = cmpxchg ptr %_cctor_init_d, i8 0, i8 1 acquire acquire");
+            Emitter.WriteLine("    %_cctor_init_success = extractvalue { i8, i1 } %_cctor_init_cmp, 1");
+            Emitter.WriteLine("    br i1 %_cctor_init_success, label %_cctor_init_run, label %_cctor_init_retry");
+
+            Emitter.WriteLine("_cctor_init_spin:");
+            Emitter.WriteLine("    br label %_cctor_init_retry");
+
+            Emitter.WriteLine("_cctor_init_run:");
+            Emitter.WriteLine($"    %_cctor_init_h = getelementptr inbounds [{AllCctors.Count} x ptr], ptr @_cctor_init_array, i64 0, i64 %_cctor_init_c");
+            Emitter.WriteLine("    %_cctor_init_i = load ptr, ptr %_cctor_init_h, align 8");
+            Emitter.WriteLine("    call void %_cctor_init_i()");
+            Emitter.WriteLine("    store atomic i8 2, ptr %_cctor_init_d release, align 1");
+            Emitter.WriteLine("    br label %_cctor_init_done");
+
+            Emitter.WriteLine("_cctor_init_done:");
+            Emitter.WriteLine("    ret void");
+            Emitter.WriteLine("}");
         }
 
         public void Run(string outFile)
@@ -175,6 +182,12 @@ namespace IL2LLVM.Compiler
                 using (StreamWriter write = new(File.Open(outFile, FileMode.Create)))
                 {
                     emitter = write;
+
+                    Emitter.WriteLine("; Compiled with IL2LLVM | Aquanite, LLC");
+                    Emitter.WriteLine($"target datalayout = \"p:{ptrWidth * 8}:{ptrWidth * 8}\"");
+                    string llvmTarget = TargetMatch[targetDouble];
+                    if (!string.IsNullOrEmpty(llvmTarget))
+                        Emitter.WriteLine($"target triple = \"{llvmTarget}\"");
 
                     // Get all types in the module
                     var namespaceGroups = module.Types
@@ -247,7 +260,8 @@ namespace IL2LLVM.Compiler
 
         private void CompileMethod(MethodDefinition method)
         {
-            
+            currentMethod = method;
+
             // Reset state
             analyticalStack.Clear();
             tempRegisterCounter = 0;
@@ -282,8 +296,10 @@ namespace IL2LLVM.Compiler
                 if (!string.IsNullOrEmpty(callName))
                 {
                     string args = string.Join(",", argTypes);
-
-                    DeclareLabels.Add($"declare {returnType} @{callName}({args})");
+                    if (targetDouble == "i686-windows")
+                        DeclareLabels.Add($"declare x86_stdcallcc {returnType} @{callName}({args})"); // 32 bit windows weird
+                    else
+                        DeclareLabels.Add($"declare {returnType} @{callName}({args})");
                 }
                 
                 return; // No need to compile instructions or headers
@@ -351,7 +367,7 @@ namespace IL2LLVM.Compiler
 
                     Instruction operand = (Instruction)ins.Operand;
 
-                    InstructionLabels.TryAdd(operand, $"IL_{operand.Offset:X4}");
+                    InstructionLabels.TryAdd(operand, $"IL_{operand.Offset:X8}");
                 }
             }
         }
@@ -389,9 +405,10 @@ namespace IL2LLVM.Compiler
                 _            => false
             };
         }
-        private bool IsInstruction(object operand) => operand is Instruction;
-        private bool IsVariable(object operand) => operand is VariableDefinition;
-
+        private static bool IsInstruction(object operand) => operand is Instruction;
+        private static bool IsVariable(object operand) => operand is VariableDefinition;
+        private string Temporary() => $"%t_{tempRegisterCounter++}";
+        private string TemporaryBranch() => $"%br_{tempBranchCounter++}";
         private static string? GetNativeCallName(MethodDefinition method)
         {
             // Is it a native call?
@@ -401,6 +418,23 @@ namespace IL2LLVM.Compiler
             return attr is null
                 ? null
                 : (string)attr.ConstructorArguments[0].Value;
+        }
+
+        private static string? GetNativeCallName(MethodReference methodref)
+        {
+            if (methodref is MethodDefinition)
+            {
+                MethodDefinition method = (MethodDefinition)methodref;
+                // Is it a native call?
+                var attr = method.CustomAttributes.FirstOrDefault(a =>
+                    a.AttributeType.FullName == "IL2LLVM.Attributes.NativeCall");
+
+                return attr is null
+                    ? null
+                    : (string)attr.ConstructorArguments[0].Value;
+            }
+
+            return null;
         }
 
         private static string? GetEntryPoint(MethodDefinition method)
@@ -424,6 +458,7 @@ namespace IL2LLVM.Compiler
         }
 
         private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
+        private static bool IsNativeCall(MethodReference method) => GetNativeCallName(method) != null;
         private static bool IsEntryPoint(MethodDefinition method) => GetEntryPoint(method) != null;
 
         private static string ToLLVMUnicodeString(string str)
@@ -449,8 +484,8 @@ namespace IL2LLVM.Compiler
         {
             return new Dictionary<Code, Action<Instruction>>
             {
-                [Code.Nop]          = _ => NOP(),
-                [Code.Break]        = _ => BREAK(),
+                [Code.Nop]          = _ => {},
+                [Code.Break]        = _ => Emitter.WriteLine(Call.Formulate("void", "llvm.debugtrap", [])),
                 [Code.Ldarg_0]      = _ => LDARG(0),
                 [Code.Ldarg_1]      = _ => LDARG(1),
                 [Code.Ldarg_2]      = _ => LDARG(2),
@@ -500,6 +535,8 @@ namespace IL2LLVM.Compiler
                 [Code.Volatile]     = _ => VOLATILE(),
                 [Code.Br_S]         = instruction => BR(instruction.Operand),
                 [Code.Br]           = instruction => BR(instruction.Operand),
+                [Code.Brfalse_S]    = instruction => BRFALSE(instruction),
+                [Code.Brfalse]      = instruction => BRFALSE(instruction),
                 [Code.Ldstr]        = instruction => LDSTR((string)instruction.Operand),
                 [Code.Conv_U]       = _ => CONV_U(),
                 [Code.Conv_I]       = _ => CONV_I(),
@@ -535,7 +572,7 @@ namespace IL2LLVM.Compiler
             };
         }
 
-        private static string GetVarType(TypeReference variableType)
+        private string GetVarType(TypeReference variableType)
         {
             if (variableType.IsPointer)
             {
@@ -546,20 +583,21 @@ namespace IL2LLVM.Compiler
 
             return typeName switch
             {
-                "System.Void" => "void",
+                "System.Void"    => "void",
                 "System.Boolean" => "i1",
-                "System.Byte" => "i8",
-                "System.SByte" => "i8",
-                "System.Int16" => "i16",
-                "System.UInt16" => "i16",
-                "System.Int32" => "i32",
-                "System.UInt32" => "i32",
-                "System.Int64" => "i64",
-                "System.UInt64" => "i64",
-                "System.Single" => "float",
-                "System.Double" => "double",
-                "System.String" => "ptr",
-                _ => throw new NotSupportedException($"Unsupported variable type: {variableType.FullName}")
+                "System.Byte"    => "i8",
+                "System.SByte"   => "i8",
+                "System.Int16"   => "i16",
+                "System.UInt16"  => "i16",
+                "System.Int32"   => "i32",
+                "System.UInt32"  => "i32",
+                "System.Int64"   => "i64",
+                "System.UInt64"  => "i64",
+                "System.Single"  => "float",
+                "System.Double"  => "double",
+                "System.String"  => "ptr",
+                "System.IntPtr"  => TargetNativeIntType,
+                _                => throw new NotSupportedException($"Unsupported variable type: {variableType.FullName}")
             };
         }
 
@@ -581,15 +619,15 @@ namespace IL2LLVM.Compiler
         {
             return type switch
             {
-                "i1"   => true,
-                "i8"   => true,
-                "i16"  => true,
-                "i32"  => true,
-                "i64"  => true,
-                "float" => true,
+                "i1"     => true,
+                "i8"     => true,
+                "i16"    => true,
+                "i32"    => true,
+                "i64"    => true,
+                "float"  => true,
                 "double" => true,
-                "ptr"  => false, // Cant tell what it points to, so skip for now
-                _      => false
+                "ptr"    => false, // Cant tell what it points to, so skip for now
+                _        => false
             };
         }
 
@@ -616,13 +654,6 @@ namespace IL2LLVM.Compiler
             return analyticalStack.Peek();
         }
 
-        static void NOP() { }
-
-        void BREAK()
-        {
-            Emitter.WriteLine("    call void @llvm.debugtrap()");
-        }
-
         void LDARG(ushort index)
         {
             Push(new($"%arg{index}", ArgTypes[index], false));
@@ -630,7 +661,7 @@ namespace IL2LLVM.Compiler
 
         void LDLOC(ushort index)
         {
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load {LocalVarTypes[index]}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
             Push(new(tempReg, LocalVarTypes[index], false));
         }
@@ -650,8 +681,12 @@ namespace IL2LLVM.Compiler
 
         void LDLOCA(VariableDefinition index)
         {
-            string tempReg = $"%t_{tempRegisterCounter++}";
-            Emitter.WriteLine($"    {tempReg} = getelementptr inbounds {LocalVarTypes[index.Index]}, ptr {LocalVars[index.Index].Value}, i64 0");
+            string tempReg = Temporary();
+            Emitter.WriteLine(GetElementPointer.Formulate(tempReg, 
+                                                          LocalVarTypes[index.Index], 
+                                                          LocalVars[index.Index].Value, 
+                                                          ["i64 0"]));
+            
             Push(new(tempReg, "ptr", false));
         }
 
@@ -750,7 +785,7 @@ namespace IL2LLVM.Compiler
                 // If function expects a pointer, but stack has an integer, cast it inline
                 if (t == "ptr" && currentType.StartsWith("i"))
                 {
-                    string castReg = $"%t_{tempRegisterCounter++}";
+                    string castReg = Temporary();
                     Emitter.WriteLine($"    {castReg} = inttoptr {currentType} {val} to ptr");
                     return $"ptr {castReg}";
                 }
@@ -758,16 +793,14 @@ namespace IL2LLVM.Compiler
                 return $"{t} {val}";
             });
 
-            string argsString = string.Join(", ", formattedArgs);
-
             if (returnType == "void")
             {
-                Emitter.WriteLine($"    call void @{mangledName}({argsString})");
+                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], isWindowsNative: IsNativeCall(method)));
             }
             else
             {
-                string tempReg = $"%t_{tempRegisterCounter++}";
-                Emitter.WriteLine($"    {tempReg} = call {returnType} @{mangledName}({argsString})");
+                string tempReg = Temporary();
+                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], tempReg, isWindowsNative: IsNativeCall(method))); 
                 Push(new(tempReg, returnType, false));
             }
         }
@@ -779,7 +812,7 @@ namespace IL2LLVM.Compiler
 
             if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
             {
-                string tempReg = $"%t_{tempRegisterCounter++}";
+                string tempReg = Temporary();
                 string llvmOp = a.Type switch
                 {
                     "float" => "fadd",
@@ -799,7 +832,7 @@ namespace IL2LLVM.Compiler
 
             if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
             {
-                string tempReg = $"%t_{tempRegisterCounter++}";
+                string tempReg = Temporary();
                 string llvmOp = a.Type switch
                 {
                     "float" => "fsub",
@@ -841,7 +874,7 @@ namespace IL2LLVM.Compiler
 
             string fieldName = Mangler.Mangle(field);
             string fieldType = GetVarType(field.FieldType);
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load {(nextIsVolatile ? "volatile" : "")} {fieldType}, ptr @{fieldName}, align {GetAlignmentForType(fieldType)}");
             Push(new(tempReg, fieldType, false));
             nextIsVolatile = false;
@@ -880,6 +913,21 @@ namespace IL2LLVM.Compiler
             throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}");
         }
 
+        void BRFALSE(object operand)
+        {
+            if (!IsInstruction(operand))
+                throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}"); 
+
+            if (InstructionLabels.TryGetValue((Instruction)operand, out string? label) && !string.IsNullOrEmpty(label))
+            {
+                LLVMObject cond = Pop();
+                string br = TemporaryBranch();
+                
+            }
+
+            throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}");
+        }
+
         void LDSTR(string value)
         {
             string globalName = $"str_{stringCounter++}";
@@ -887,8 +935,14 @@ namespace IL2LLVM.Compiler
 
             DeclareLabels.Add($"@{globalName} = private unnamed_addr constant [{llvmString.Length / 3} x i8] c\"{llvmString}\", align 1");
             
-            string tempReg = $"%t_{tempRegisterCounter++}";
-            Emitter.WriteLine($"    {tempReg} = getelementptr inbounds [{llvmString.Length / 3} x i8], ptr @{globalName}, i64 0, i64 0");
+            string tempReg = Temporary();
+            Emitter.WriteLine(GetElementPointer.Formulate(tempReg, 
+                                        "i8", 
+                                        $"@{globalName}", 
+                                        ["i64 0", "i64 0"],
+                                        true,
+                                        llvmString.Length / 3));
+            
 
             Push(new(tempReg, "ptr", false));
         }
@@ -897,7 +951,7 @@ namespace IL2LLVM.Compiler
         {
             LLVMObject value = Pop();
             if (value.Type == "float") { Push(value); return; }
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             string llvmOp = value.Type switch
             {
                 "double" => "fptrunc",
@@ -911,7 +965,7 @@ namespace IL2LLVM.Compiler
         {
             LLVMObject value = Pop();
             if (value.Type == "double") { Push(value); return; }
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             string llvmOp = value.Type switch
             {
                 "float" => "fpext",
@@ -925,7 +979,7 @@ namespace IL2LLVM.Compiler
         {
             LLVMObject value = Pop();
             if (value.Type == targetType) { Push(new(value.Value, targetType, targetUnsigned)); return; }
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             if (value.Type == "ptr")
             {
                 Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
@@ -960,7 +1014,7 @@ namespace IL2LLVM.Compiler
             string targetType = $"i{ptrWidth * 8}";
             if (value.Type == "ptr")
             {
-                string tempReg = $"%t_{tempRegisterCounter++}";
+                string tempReg = Temporary();
                 Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
                 Push(new(tempReg, targetType, true));
                 return;
@@ -975,7 +1029,7 @@ namespace IL2LLVM.Compiler
             string targetType = $"i{ptrWidth * 8}";
             if (value.Type == "ptr")
             {
-                string tempReg = $"%t_{tempRegisterCounter++}";
+                string tempReg = Temporary();
                 Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to {targetType}");
                 Push(new(tempReg, targetType, false));
                 return;
@@ -1142,7 +1196,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i64, ptr {address.Value}, align 8");
             Push(new(tempReg, "i64", false));
         }
@@ -1157,7 +1211,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i1, ptr {address.Value}, align 1");
             Push(new(tempReg, "i1", false));
         }
@@ -1172,7 +1226,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i16, ptr {address.Value}, align 2");
             Push(new(tempReg, "i16", false));
         }
@@ -1187,7 +1241,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i32, ptr {address.Value}, align 4");
             Push(new(tempReg, "i32", false));
         }
@@ -1202,7 +1256,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i64, ptr {address.Value}, align 8");
             Push(new(tempReg, "i64", false));
         }
@@ -1217,7 +1271,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load float, ptr {address.Value}, align 4");
             Push(new(tempReg, "float", false));
         }
@@ -1232,7 +1286,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load double, ptr {address.Value}, align 8");
             Push(new(tempReg, "double", false));
         }
@@ -1247,9 +1301,9 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i8, ptr {address.Value}, align 1");
-            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            string tempReg2 = Temporary();
             Emitter.WriteLine($"    {tempReg2} = zext i8 {tempReg} to i32");
             Push(new(tempReg2, "i32", true));
         }
@@ -1264,9 +1318,9 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i16, ptr {address.Value}, align 2");
-            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            string tempReg2 = Temporary();
             Emitter.WriteLine($"    {tempReg2} = zext i16 {tempReg} to i32");
             Push(new(tempReg2, "i32", true));
         }
@@ -1281,9 +1335,9 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load i32, ptr {address.Value}, align 4");
-            string tempReg2 = $"%t_{tempRegisterCounter++}";
+            string tempReg2 = Temporary();
             Emitter.WriteLine($"    {tempReg2} = zext i32 {tempReg} to i64");
             Push(new(tempReg2, "i64", true));
         }
@@ -1298,7 +1352,7 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
             Emitter.WriteLine($"    {tempReg} = load ptr, ptr {address.Value}, align {ptrWidth}");
             Push(new(tempReg, "ptr", false));
         }
@@ -1329,7 +1383,7 @@ namespace IL2LLVM.Compiler
             if (value.Type == targetType)
                 return value;
 
-            string tempReg = $"%t_{tempRegisterCounter++}";
+            string tempReg = Temporary();
 
             if (targetType == "ptr")
             {

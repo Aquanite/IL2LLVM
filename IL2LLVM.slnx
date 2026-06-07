@@ -1,5 +1,5 @@
 <Solution>
   <Project Path="src/IL2LLVM.csproj" />
   <Project Path="src-attr/IL2LLVM.Attributes.csproj" />
-  <Project Path="tests\00\00.csproj" />
+  <Project Path="tests/00/00.csproj" />
 </Solution>
