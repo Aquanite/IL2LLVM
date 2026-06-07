@@ -331,6 +331,8 @@ namespace IL2LLVM.Compiler
                     Emitter.WriteLine($"    br label %{label} ; SEPERATOR"); // god awful branch rules, let llvm optimize this out
                     Emitter.WriteLine($"{label}:");
                 }
+
+                // Emitter.WriteLine($"; IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
                 CompileInstruction(instruction);
             }
 
@@ -1051,7 +1053,7 @@ namespace IL2LLVM.Compiler
         void CONV_U()
         {
             LLVMObject value = Pop();
-            string targetType = $"i{ptrWidth * 8}";
+            string targetType = $"i{nativeWord * 8}";
             if (value.Type == "ptr")
             {
                 string tempReg = TemporaryRegister();

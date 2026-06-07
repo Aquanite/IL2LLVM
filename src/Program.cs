@@ -75,7 +75,7 @@ namespace IL2LLVM
                 }
                 else if (args[i] == "--ptr-width")
                 {
-                    if (i + 1 < args.Length && byte.TryParse(args[i + 1], out byte width))
+                    if (i + 1 < args.Length && byte.TryParse(args[i + 1], out byte width) && width != 0)
                     {
                         ptrWidth = width;
                         setPtrWidth = true;
@@ -89,7 +89,7 @@ namespace IL2LLVM
                 }
                 else if (args[i] == "--native-word")
                 {
-                    if (i + 1 < args.Length && byte.TryParse(args[i + 1], out byte width))
+                    if (i + 1 < args.Length && byte.TryParse(args[i + 1], out byte width) && width != 0)
                     {
                         nativeWord = width;
                         setNativeWord = true;
