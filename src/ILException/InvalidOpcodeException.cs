@@ -1,4 +1,4 @@
-namespace IL2LLVM.Compiler
+namespace IL2LLVM.ILException
 {
     [Serializable]
     internal class InvalidOpcodeException : Exception

@@ -7,15 +7,9 @@ public class Program
     [EntryPoint]
     public static int Main()
     {
-        bool x = true;
-
-        if (x)
+        for (int i = 0; i < 5; i++)
         {
-            Test.Write("Hello, World!", 13);
-        }
-        else
-        {
-            Test.Write("Goodbye, World!", 15);
+            Test.Write("Hello, world!\n", 14);       
         }
         return 0;
     }
@@ -25,7 +19,7 @@ public static unsafe class Test
 {
     private static readonly int STD_OUT = -11;
 
-    public static void Write(string str, ulong length)
+    public static void Write(string str, nint length)
     {
         void* handle = Native.GetHandle(STD_OUT);
         Native.WriteConsole(handle, str, length, null, null);
@@ -35,7 +29,7 @@ public static unsafe class Test
 public static unsafe class Native
 {
     [NativeCall("WriteConsoleW")]
-    public static int WriteConsole(void* handle, string lpcwstr, ulong charsToWrite, ulong* charsWritten, void* reserved) 
+    public static int WriteConsole(void* handle, string lpcwstr, nint charsToWrite, nint* charsWritten, void* reserved) 
         => throw new NotImplementedException();
 
     [NativeCall("GetStdHandle")]

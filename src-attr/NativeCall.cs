@@ -1,12 +1,7 @@
 ﻿namespace IL2LLVM.Attributes;
 
 [AttributeUsage(AttributeTargets.Method)]
-public class NativeCall : Attribute
+public class NativeCall(string name) : Attribute
 {
-    public string Name { get; }
-
-    public NativeCall(string name)
-    {
-        Name = name;
-    }
+    public string Name { get; } = name;
 }

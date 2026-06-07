@@ -36,7 +36,9 @@ namespace IL2LLVM
             string outputFile = null!;
 
             byte ptrWidth = (byte)IntPtr.Size;
+            byte nativeWord = ptrWidth;
             bool setPtrWidth = false;
+            bool setNativeWord = false;
             bool bundleCorelib = false;
             bool useUnicode = false;
 
@@ -82,6 +84,20 @@ namespace IL2LLVM
                     else
                     {
                         Console.WriteLine("FATAL: Option '--ptr-width' requires a valid pointer width.");
+                        return;
+                    }
+                }
+                else if (args[i] == "--native-word")
+                {
+                    if (i + 1 < args.Length && byte.TryParse(args[i + 1], out byte width))
+                    {
+                        nativeWord = width;
+                        setNativeWord = true;
+                        i++;
+                    }
+                    else
+                    {
+                        Console.WriteLine("FATAL: Option '--native-word' requires a valid native width.");
                         return;
                     }
                 }
@@ -159,7 +175,10 @@ namespace IL2LLVM
                 if (width != -1 && width != -2 && width != ptrWidth)
                     Console.WriteLine($"WARN: Module architecture is {width * 8}-bit while selected Pointer Width is {ptrWidth * 8}-bit.");
 
-                var compiler = new Spratcher(module, ptrWidth, targetDouble, bundleCorelib, useUnicode);
+                if (!setNativeWord)
+                    nativeWord = ptrWidth;
+
+                var compiler = new Spratcher(module, ptrWidth, nativeWord, targetDouble, bundleCorelib, useUnicode);
                 compiler.Run(outputFile);
             }
             catch (Exception ex)
