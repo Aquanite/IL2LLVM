@@ -11,11 +11,11 @@ namespace IL2LLVM.Formulae
         string returnValue
     ) : Formula
     {
-        private bool _isUnsigned = isUnsigned;
-        private string _oldType = oldType;
-        private string _value = value;
-        private string _newType = newType;
-        private string _returnValue = returnValue;
+        private readonly bool _isUnsigned = isUnsigned;
+        private readonly string _oldType = oldType;
+        private readonly string _value = value;
+        private readonly string _newType = newType;
+        private readonly string _returnValue = returnValue;
 
         public override string Formulate()
         {

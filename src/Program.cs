@@ -8,7 +8,7 @@ namespace IL2LLVM
 {
     internal class Program
     {
-        private static string[] supportedTargets = [
+        private static readonly string[] supportedTargets = [
             "i686-windows",
             "i686-linux",
             "i686-darwin",

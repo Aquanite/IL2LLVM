@@ -12,12 +12,12 @@ namespace IL2LLVM.Formulae
         bool isFloat = false
     ) : Formula
     {
-        private LLVMComparison _predicate = predicate;
-        private string _type = type;
-        private string _op1 = op1;
-        private string _op2 = op2;
-        private string _returnValue = returnValue;
-        private bool _isFloat = isFloat;
+        private readonly LLVMComparison _predicate = predicate;
+        private readonly string _type = type;
+        private readonly string _op1 = op1;
+        private readonly string _op2 = op2;
+        private readonly string _returnValue = returnValue;
+        private readonly bool _isFloat = isFloat;
 
         public override string Formulate()
         {

@@ -78,9 +78,9 @@ namespace IL2LLVM.Compiler
             this.unicodeStrings = unicodeStrings;
             this.targetDouble = targetDouble;
             instructionHandlers = BuildInstructionHandlers();
-            declareLabels = new List<string>();
-            calledCctors = new List<string>();
-            allCctors = new List<string>();
+            declareLabels = [];
+            calledCctors = [];
+            allCctors = [];
             currentMethod = null!; // Is okay because it's not used until it IS set
         }
 
@@ -200,9 +200,13 @@ namespace IL2LLVM.Compiler
                             {
                                 if (IsNativeCall(method))
                                 {
-                                    string? callName = GetNativeCallName(method);
-                                    if (!string.IsNullOrEmpty(callName)) 
-                                        Mangler.AddNativeCall(method.FullName, callName);
+                                    Mangler.AddNativeCall(method.FullName, GetNativeCallName(method)!);
+                                    Console.WriteLine($"INFO: Added NativeCall:    \u001b[33m'{method.FullName}'\u001b[0m to \u001b[32m'{GetNativeCallName(method)!}'\u001b[0m");
+                                }
+                                if (IsPlugReference(method))
+                                {
+                                    Mangler.AddPlugReference(GetPlugReference(method)!, method);
+                                    Console.WriteLine($"INFO: Added PlugReference: \u001b[33m'{GetPlugReference(method)!}'\u001b[0m to \u001b[32m'{method.FullName}'\u001b[0m");
                                 }
                             }
                         }
@@ -331,7 +335,7 @@ namespace IL2LLVM.Compiler
                     Emitter.WriteLine($"    br label %{label} ; SEPERATOR"); // god awful branch rules, let llvm optimize this out
                     Emitter.WriteLine($"{label}:");
                 }
-
+                Emitter.WriteLine($"; IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
                 // Emitter.WriteLine($"; IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
                 CompileInstruction(instruction);
             }
@@ -354,7 +358,7 @@ namespace IL2LLVM.Compiler
 
         private void InitializeInstructionLabels(Instruction[] instructions)
         {
-            instructionLabels = new Dictionary<Instruction, string>();
+            instructionLabels = [];
             
             foreach (Instruction ins in instructions)
             {
@@ -458,9 +462,21 @@ namespace IL2LLVM.Compiler
             return string.IsNullOrEmpty(renameTo) ? "main" : renameTo;
         }
 
+        private static string? GetPlugReference(MethodDefinition method)
+        {
+            // Is it a plug?
+            var attr = method.CustomAttributes.FirstOrDefault(a =>
+                a.AttributeType.FullName == "IL2LLVM.Attributes.Plug");
+
+            return attr is null
+                ? null
+                : (string)attr.ConstructorArguments[0].Value;
+        }
+
         private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
         private static bool IsNativeCall(MethodReference method) => GetNativeCallName(method) != null;
         private static bool IsEntryPoint(MethodDefinition method) => GetEntryPoint(method) != null;
+        private static bool IsPlugReference(MethodDefinition method) => GetPlugReference(method) != null;
 
         private static string ToLLVMUnicodeString(string str)
         {
@@ -743,10 +759,17 @@ namespace IL2LLVM.Compiler
         { 
             if (!method.HasThis)
             {
+                MethodReference toCctorCheck = method;
+                MethodDefinition? possiblePlug = Mangler.GetPlugReference(method.FullName);
+                if (possiblePlug != null)
+                {
+                    toCctorCheck = possiblePlug;
+                }
+
                 TypeDefinition? typeDef = null;
                 try
                 {
-                    typeDef = method.DeclaringType.Resolve();
+                    typeDef = toCctorCheck.DeclaringType.Resolve();
                 }
                 catch {}
 
@@ -818,19 +841,35 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
+            Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+            if (bigger == 1 && a.Type[0] == 'i') // a
             {
-                string tempReg = TemporaryRegister();
-                string llvmOp = a.Type switch
-                {
-                    "float" => "fadd",
-                    "double" => "fadd",
-                    _ => "add"
-                };
-                Emitter.WriteLine($"    {tempReg} = {llvmOp} {a.Type} {a.Value}, {b.Value}");
-                Push(new(tempReg, a.Type, false));
+                Push(b);
+                EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                Push(a);
+                ADD(); // Try again
                 return;
             }
+            else if (bigger == 2 && a.Type[0] == 'i') // b
+            {
+                Push(b);
+                Push(a);
+                EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                ADD(); // Try again
+                return;
+            }
+
+            string tempReg = TemporaryRegister();
+            string llvmOp = a.Type switch
+            {
+                "float" => "fadd",
+                "double" => "fadd",
+                _ => "add"
+            };
+            Emitter.WriteLine($"    {tempReg} = {llvmOp} {a.Type} {a.Value}, {b.Value}");
+            Push(new(tempReg, a.Type, false));
+            return;
         }
 
         void SUB()
@@ -838,7 +877,7 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (IsWorkableType(a.Type) && IsWorkableType(b.Type) && a.Type == b.Type)
+            if (a.Type == b.Type)
             {
                 string tempReg = TemporaryRegister();
                 string llvmOp = a.Type switch
@@ -1418,8 +1457,25 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (a.Type != b.Type)
-                throw new InvalidDataException($"CEQ invalid comparison: a={a.Type}, b={b.Type}");
+            Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+            if (bigger == 1 && a.Type[0] == 'i') // a
+            {
+                Push(a);
+                Push(b);
+                EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                CEQ(); // Try again
+                return;
+            }
+            else if (bigger == 2 && a.Type[0] == 'i') // b
+            {
+                
+                Push(a);
+                EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                Push(b);
+                CEQ(); // Try again
+                return;
+            }
             
             string tmp = TemporaryRegister();
             string res = TemporaryRegister();
@@ -1443,8 +1499,24 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (a.Type != b.Type)
-                throw new InvalidDataException($"CEQ invalid comparison: a={a.Type}, b={b.Type}");
+            Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+            if (bigger == 1 && a.Type[0] == 'i') // a
+            {
+                Push(a);
+                Push(b);
+                EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                CLT(); // Try again
+                return;
+            }
+            else if (bigger == 2 && a.Type[0] == 'i') // b
+            {
+                Push(a);
+                EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                Push(b);
+                CLT(); // Try again
+                return;
+            }
             
             string tmp = TemporaryRegister();
             string res = TemporaryRegister();
@@ -1468,8 +1540,24 @@ namespace IL2LLVM.Compiler
             LLVMObject b = Pop();
             LLVMObject a = Pop();
 
-            if (a.Type != b.Type)
-                throw new InvalidDataException($"CEQ invalid comparison: a={a.Type}, b={b.Type}");
+            Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+            if (bigger == 1 && a.Type[0] == 'i') // a
+            {
+                Push(a);
+                Push(b);
+                EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                CGT(); // Try again
+                return;
+            }
+            else if (bigger == 2 && a.Type[0] == 'i') // b
+            {
+                Push(a);
+                EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                Push(b);
+                CGT(); // Try again
+                return;
+            }
             
             string tmp = TemporaryRegister();
             string res = TemporaryRegister();

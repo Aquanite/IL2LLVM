@@ -27,9 +27,17 @@ namespace IL2LLVM.Compiler
             { "System.UIntPtr", "up" },
         }.ToFrozenDictionary();
 
-        private static Dictionary<string, string> nativeCalls = new Dictionary<string, string>();
+        private static readonly Dictionary<string, string> nativeCalls = [];
+        private static readonly Dictionary<string, MethodDefinition> plugReference = [];
 
         public static void AddNativeCall(string before, string after) => nativeCalls.Add(before, after);
+        public static void AddPlugReference(string toPlug, MethodDefinition toMangle) => plugReference.Add(toPlug, toMangle);
+        public static MethodDefinition? GetPlugReference(string toPlug)
+        {
+            if (plugReference.TryGetValue(toPlug, out MethodDefinition? value))
+                return value;
+            else return null;
+        }
 
         public static string Mangle(FieldDefinition field)
         {
@@ -45,6 +53,13 @@ namespace IL2LLVM.Compiler
                 return Mangle(def);
             }
 
+            if (plugReference.TryGetValue(method.FullName, out MethodDefinition? plugName) && plugName != null)
+            {
+                return Mangle(plugName);
+            }
+
+            // Assume no native calls since we don't have the module
+
             return Mangle(method.DeclaringType.FullName, method.Name, method.Parameters);
         }
 
@@ -54,6 +69,15 @@ namespace IL2LLVM.Compiler
             {
                 return nativeName; // No mangling
             }
+
+            if (plugReference.TryGetValue(method.FullName, out MethodDefinition? plugName) && plugName != null)
+            {
+                if (plugName == method)
+                    throw new InvalidOperationException($"Mangling failed for '{method.FullName}' as `plugName` is the target of `method`.");
+
+                return Mangle(plugName);
+            }
+
             return Mangle(method.DeclaringType.FullName, method.Name, method.Parameters);
         }
 

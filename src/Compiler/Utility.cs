@@ -35,6 +35,56 @@ namespace IL2LLVM.Compiler
             };
         }
 
+        public static string GetBiggerType(string a, string b, out byte biggerOne)
+        {
+            if (a == b)
+            {
+                biggerOne = 0;
+                return a;
+            }
+
+            if (a[0] != b[0])
+                throw new InvalidDataException($"Cannot compare types '{a}' and '{b}' as they are of different categories.");
+
+            char typeCategory = a[0];
+            if (typeCategory == 'i')
+            {
+                int aBits = int.Parse(a.Substring(1));
+                int bBits = int.Parse(b.Substring(1));
+
+                if (aBits > bBits)
+                {
+                    biggerOne = 1;
+                    return a;
+                }
+                else
+                {
+                    biggerOne = 2;
+                    return b;
+                }
+            }
+            else if (typeCategory == 'f')
+            {
+                int aBits = int.Parse(a.Substring(1));
+                int bBits = int.Parse(b.Substring(1));
+
+                if (aBits > bBits)
+                {
+                    biggerOne = 1;
+                    return a;
+                }
+                else
+                {
+                    biggerOne = 2;
+                    return b;
+                }
+            }
+            else
+            {
+                throw new InvalidDataException($"Unsupported type category '{typeCategory}' for comparison.");
+            }
+        }
+
         public static string ToHex(string input)
         {
             if (string.IsNullOrWhiteSpace(input))
