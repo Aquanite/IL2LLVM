@@ -22,7 +22,7 @@ Contributions to IL2LLVM are welcome! If you have an idea for a new feature or h
 
 # Acknowledgements
 - The Mono.Cecil library is used for reading and manipulating .NET assemblies.
-- The LLVM project provides the tools and libraries for generating and compiling LLVM IR.
+- The LLVM project provides the tools and libraries for compiling LLVM IR.
 
 # Contact
 For questions or support, please open an issue on the GitHub repository or contact the maintainer at [@Aquanite, LLC](https://github.com/Aquanite).
