@@ -803,12 +803,12 @@ namespace IL2LLVM.Compiler
 
             if (returnType == "void")
             {
-                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], isWindowsNative: IsNativeCall(method)));
+                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], isWindowsNative: IsNativeCall(method) && targetDouble == "i686-windows"));
             }
             else
             {
                 string tempReg = TemporaryRegister();
-                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], tempReg, isWindowsNative: IsNativeCall(method))); 
+                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], tempReg, isWindowsNative: IsNativeCall(method) && targetDouble == "i686-windows")); 
                 Push(new(tempReg, returnType, false));
             }
         }
