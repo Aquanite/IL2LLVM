@@ -48,10 +48,12 @@ namespace IL2LLVM.Compiler
 
         public static string Mangle(MethodReference method)
         {
-            if (method is MethodDefinition def)
+            try
             {
+                var def = method.Resolve();
                 return Mangle(def);
             }
+            catch (Exception) {}
 
             if (plugReference.TryGetValue(method.FullName, out MethodDefinition? plugName) && plugName != null)
             {

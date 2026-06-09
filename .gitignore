@@ -7,3 +7,5 @@
 tests/00/00.dll
 tests/00/out.exe
 tests/00/out.ll
+tests/01/01.dll
+tests/00/01.dll

@@ -9,8 +9,5 @@
     <Reference Include="IL2LLVM.Attributes">
       <HintPath>../IL2LLVM.Attributes.dll</HintPath>
     </Reference>
-    <Reference Include="01">
-      <HintPath>01.dll</HintPath>
-    </Reference>
   </ItemGroup>
 </Project>

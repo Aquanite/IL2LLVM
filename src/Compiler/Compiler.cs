@@ -7,6 +7,7 @@ using IL2LLVM.ILException;
 using Microsoft.VisualBasic;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
 
 namespace IL2LLVM.Compiler
 {
@@ -14,7 +15,7 @@ namespace IL2LLVM.Compiler
     public class Spratcher
     {
         private StreamWriter? emitter;
-        private readonly ModuleDefinition module;
+        private readonly List<AssemblyDefinition> assemblies;
         private readonly Stack<LLVMObject> analyticalStack = new();
         private LLVMObject[]? localVars;
         private string[]? localVarTypes;
@@ -69,9 +70,9 @@ namespace IL2LLVM.Compiler
             }
         }
 
-        public Spratcher(ModuleDefinition module, byte ptrWidth, byte nativeWord, string targetDouble, bool bundleCorelib = false, bool unicodeStrings = true)
+        public Spratcher(List<AssemblyDefinition> assemblies, byte ptrWidth, byte nativeWord, string targetDouble, bool bundleCorelib = false, bool unicodeStrings = true)
         {
-            this.module = module;
+            this.assemblies = assemblies;
             this.ptrWidth = ptrWidth;
             this.nativeWord = nativeWord;
             this.bundleCorelib = bundleCorelib;
@@ -186,10 +187,12 @@ namespace IL2LLVM.Compiler
                     if (!string.IsNullOrEmpty(llvmTarget))
                         Emitter.WriteLine($"target triple = \"{llvmTarget}\"");
 
-                    // Get all types in the module
-                    var namespaceGroups = module.Types
-                        .Where(t => !t.IsNested)
-                        .GroupBy(t => t.Namespace);
+                    // Get all types in the assemblies
+                    var namespaceGroups = assemblies
+                        .SelectMany(a => a.Modules)
+                        .SelectMany(m => m.GetAllTypes())
+                        .GroupBy(t => t.IsNested ? t.DeclaringType.Namespace : t.Namespace);
+
 
                     // Precache all native calls
                     foreach (var namespaceGroup in namespaceGroups)
@@ -428,18 +431,16 @@ namespace IL2LLVM.Compiler
 
         private static string? GetNativeCallName(MethodReference methodref)
         {
-            if (methodref is MethodDefinition method)
+            try
             {
-                // Is it a native call?
-                var attr = method.CustomAttributes.FirstOrDefault(a =>
-                    a.AttributeType.FullName == "IL2LLVM.Attributes.NativeCall");
-
-                return attr is null
-                    ? null
-                    : (string)attr.ConstructorArguments[0].Value;
+                var def = methodref.Resolve();
+                return GetNativeCallName(def);
             }
-
-            return null;
+            catch (Exception) // No
+            {
+                Console.WriteLine($"WARN: Unable to resolve '{methodref.FullName}'. Is it in an included assembly?");
+                return null;
+            }
         }
 
         private static string? GetEntryPoint(MethodDefinition method)

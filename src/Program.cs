@@ -32,7 +32,7 @@ namespace IL2LLVM
         };
         static void Main(string[] args)
         {
-            string inputFile = null!;
+            List<string> inputFiles = [];
             string outputFile = null!;
 
             byte ptrWidth = (byte)IntPtr.Size;
@@ -41,6 +41,8 @@ namespace IL2LLVM
             bool setNativeWord = false;
             bool bundleCorelib = false;
             bool useUnicode = false;
+
+            var resolver = new DefaultAssemblyResolver();
 
             string targetDouble =
                 OperatingSystem.IsWindows() ? "x86_64-windows" :
@@ -138,7 +140,21 @@ namespace IL2LLVM
                 }
                 else if (!args[i].StartsWith('-'))
                 {
-                    inputFile ??= args[i];
+                    if (!File.Exists(args[i]))
+                    {
+                        Console.WriteLine($"FATAL: Failed to load file: {args[i]}");
+                        Environment.Exit(-1);
+                    }
+
+                    var parent = Directory.GetParent(args[i]);
+
+                    string toResolve = parent != null ? parent.FullName : Path.GetPathRoot(Directory.GetCurrentDirectory())!; // If it nulls the system is screwed anyways
+
+                    if (inputFiles.Contains(toResolve))
+                        continue; // Already added dir
+
+                    resolver.AddSearchDirectory(toResolve); // Get dir assembly is in
+                    inputFiles.Add(args[i]);
                 }
                 else
                 {
@@ -148,37 +164,57 @@ namespace IL2LLVM
                 }
             }
 
-            if (string.IsNullOrEmpty(inputFile))
+            if (resolver.GetSearchDirectories().Length == 0)
             {
-                Console.WriteLine("FATAL: No input file specified.");
-                PrintUsage();
-                return;
+                Console.WriteLine($"FATAL: No input files specified.");
+                Environment.Exit(-1);
             }
+
 
             if (string.IsNullOrEmpty(outputFile))
             {
-                outputFile = $"{inputFile}.ll";
+                outputFile = $"out.ll";
             }
 
             try
             {
+                Console.WriteLine("========== IL2LLVM ==========");
                 if (!setPtrWidth)
                     ptrWidth = GetTargetWidth(targetDouble);
+
+                var readerParameters = new ReaderParameters
+                {
+                    AssemblyResolver = resolver
+                };
+
+                List<AssemblyDefinition> loadedAssemblies = new List<AssemblyDefinition>();
+
+                foreach (var path in inputFiles)
+                {
+                    loadedAssemblies.Add(AssemblyDefinition.ReadAssembly(path, readerParameters)); // Already path-checked
+                }
                     
-                Console.WriteLine($"Compiling {inputFile} to {outputFile}...");
-                ModuleDefinition module = ModuleDefinition.ReadModule(inputFile);
-
-                int width = GetModuleBitness(module);
-                Console.WriteLine("INFO: Module width: " + (width == -1 ? "AnyCPU" : (width == -2 ? "Unknown" : width * 8)));
-                Console.WriteLine("INFO: Target: " + targetDouble);
-
-                if (width != -1 && width != -2 && width != ptrWidth)
-                    Console.WriteLine($"WARN: Module architecture is {width * 8}-bit while selected Pointer Width is {ptrWidth * 8}-bit.");
+                Console.WriteLine($"Compiling [{Path.GetFullPath(string.Join(", ", inputFiles))}] to {outputFile}...");
 
                 if (!setNativeWord)
                     nativeWord = ptrWidth;
 
-                var compiler = new Spratcher(module, ptrWidth, nativeWord, targetDouble, bundleCorelib, useUnicode);
+                foreach (var assembly in loadedAssemblies)
+                {
+                    Console.WriteLine("========== Compiling Assembly ==========");
+                    Console.WriteLine($"INFO: Assembly info: {assembly.Name}");
+                    foreach (var module in assembly.Modules)
+                    {
+                        int width = GetModuleBitness(module);
+                        Console.WriteLine("INFO: Module width: " + (width == -1 ? "AnyCPU" : (width == -2 ? "Unknown" : width * 8)));
+                        Console.WriteLine("INFO: Target: " + targetDouble);
+
+                        if (width != -1 && width != -2 && width != ptrWidth)
+                            Console.WriteLine($"WARN: Module architecture is {width * 8}-bit while selected Pointer Width is {ptrWidth * 8}-bit.");
+                    }
+                }
+                
+                var compiler = new Spratcher(loadedAssemblies, ptrWidth, nativeWord, targetDouble, bundleCorelib, useUnicode);
                 compiler.Run(outputFile);
             }
             catch (Exception ex)
