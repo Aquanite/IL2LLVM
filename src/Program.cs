@@ -194,15 +194,16 @@ namespace IL2LLVM
                     loadedAssemblies.Add(AssemblyDefinition.ReadAssembly(path, readerParameters)); // Already path-checked
                 }
                     
-                Console.WriteLine($"Compiling [{Path.GetFullPath(string.Join(", ", inputFiles))}] to {outputFile}...");
+                Console.WriteLine($"Compiling [{string.Join(", ", inputFiles.Select(Path.GetFullPath))}] to {outputFile}...");
+
 
                 if (!setNativeWord)
                     nativeWord = ptrWidth;
 
                 foreach (var assembly in loadedAssemblies)
                 {
-                    Console.WriteLine("========== Compiling Assembly ==========");
-                    Console.WriteLine($"INFO: Assembly info: {assembly.Name}");
+                    Console.WriteLine("========== Loading Assembly ==========");
+                    Console.WriteLine($"INFO: Assembly info: {assembly.FullName}");
                     foreach (var module in assembly.Modules)
                     {
                         int width = GetModuleBitness(module);
@@ -213,6 +214,8 @@ namespace IL2LLVM
                             Console.WriteLine($"WARN: Module architecture is {width * 8}-bit while selected Pointer Width is {ptrWidth * 8}-bit.");
                     }
                 }
+
+                Console.WriteLine("========== Compiling Assemblies ==========");
                 
                 var compiler = new Spratcher(loadedAssemblies, ptrWidth, nativeWord, targetDouble, bundleCorelib, useUnicode);
                 compiler.Run(outputFile);

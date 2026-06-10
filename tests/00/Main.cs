@@ -5,13 +5,11 @@ namespace ILTest;
 public static class Program
 {
     [EntryPoint]
-    public static int Main()
+    public unsafe static int Main()
     {
-        int value = Numbers.GetNumber();
-        if (value == 123)
-        {
-            Console.WriteLine("The same!");
-        }
+        nint addr = 0x12345678;
+        delegate* unmanaged[Stdcall]<string, void> printfPtr = (delegate* unmanaged[Stdcall]<string, void>)addr;
+        printfPtr("Hello, World!\n");
 
         return 0;
     }

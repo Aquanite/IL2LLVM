@@ -300,7 +300,7 @@ namespace IL2LLVM.Compiler
                 if (!string.IsNullOrEmpty(callName))
                 {
                     string args = string.Join(",", argTypes);
-                    if (targetDouble == "i686-windows")
+                    if (IsWindows32())
                         DeclareLabels.Add($"declare x86_stdcallcc {returnType} @{callName}({args})"); // 32 bit windows weird
                     else
                         DeclareLabels.Add($"declare {returnType} @{callName}({args})");
@@ -476,6 +476,8 @@ namespace IL2LLVM.Compiler
 
         private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
         private static bool IsNativeCall(MethodReference method) => GetNativeCallName(method) != null;
+        private bool IsWindows32() => targetDouble == "i686-windows";
+        private static bool IsVoid(string type) => type == "void";
         private static bool IsEntryPoint(MethodDefinition method) => GetEntryPoint(method) != null;
         private static bool IsPlugReference(MethodDefinition method) => GetPlugReference(method) != null;
 
@@ -538,6 +540,7 @@ namespace IL2LLVM.Compiler
                 [Code.Dup]          = _ => DUP(),
                 [Code.Pop]          = _ => POP(),
                 [Code.Call]         = instruction => CALL((MethodReference)instruction.Operand),
+                [Code.Calli]        = instruction => CALLI((CallSite)instruction.Operand),
                 [Code.Add]          = _ => ADD(),
                 [Code.Sub]          = _ => SUB(),
                 [Code.Stsfld]       = instruction => STSFLD((FieldDefinition)instruction.Operand),
@@ -590,7 +593,7 @@ namespace IL2LLVM.Compiler
 
         private string GetVarType(TypeReference variableType)
         {
-            if (variableType.IsPointer)
+            if (variableType.IsPointer || variableType.IsByReference || variableType.IsFunctionPointer)
             {
                 return "ptr";
             }
@@ -825,14 +828,24 @@ namespace IL2LLVM.Compiler
                 return $"{t} {val}";
             });
 
-            if (returnType == "void")
+            var nativeConv = IsNativeCall(method) && IsWindows32() 
+                ? MethodCallingConvention.StdCall 
+                : MethodCallingConvention.Default;
+
+            string tempReg = TemporaryRegister();
+
+            Call formCall = new(
+                returnType, 
+                mangledName, 
+                [.. formattedArgs], 
+                tempReg, 
+                nativeConv
+            );
+
+            Emitter.WriteLine(formCall.Formulate());
+
+            if (!IsVoid(returnType))
             {
-                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], isWindowsNative: IsNativeCall(method) && targetDouble == "i686-windows"));
-            }
-            else
-            {
-                string tempReg = TemporaryRegister();
-                Emitter.WriteLine(Call.Formulate(returnType, mangledName, [.. formattedArgs], tempReg, isWindowsNative: IsNativeCall(method) && targetDouble == "i686-windows")); 
                 Push(new(tempReg, returnType, false));
             }
         }
@@ -930,14 +943,24 @@ namespace IL2LLVM.Compiler
 
         void RET()
         {
-            if (analyticalStack.Count > 0 && Peek().Type != "void")
+            if (analyticalStack.Count > 1) // Screwed up stack
+            {
+                Console.WriteLine("FATAL: Leftover stack values:");
+                foreach (var value in analyticalStack)
+                {
+                    Console.WriteLine($"    - type {value.Type} | value {value.Value} | unsigned {value.isUnsigned}");
+                }
+                throw new Exception("Leftover stack values.");
+            }
+
+            if (analyticalStack.Count > 0 && !IsVoid(Peek().Type))
             {
                 LLVMObject returnValue = Pop();
-                Emitter.WriteLine($"    ret {returnValue.Type} {returnValue.Value}");
+                Emitter.WriteLine(Return.Formulate(returnValue.Type, returnValue.Value));
             }
             else
             {
-                Emitter.WriteLine("    ret void");
+                Emitter.WriteLine(Return.Formulate("void"));
                 analyticalStack.Clear();
             }
         }
@@ -1575,6 +1598,35 @@ namespace IL2LLVM.Compiler
             Emitter.WriteLine(Extend.Formulate(false, "i1", tmp, "i32", res));
 
             Push(new(res, "i32", false));
+        }
+
+        void CALLI(CallSite site)
+        {
+            // Support calling convs and emit the conv to llvm ir
+            MethodCallingConvention conv = site.CallingConvention;
+
+            string returnType = GetVarType(site.ReturnType);
+            string[] paramTypes = [.. site.Parameters.Select(p => GetVarType(p.ParameterType))];
+
+            LLVMObject funcPtr = Pop();
+
+            LLVMObject[] args = [.. paramTypes.Select(_ => Pop()).Reverse()];
+
+            string tempReg = TemporaryRegister();
+
+            Call indirectCall = new(
+                returnType, 
+                funcPtr.Value, 
+                [.. args.Select((a, i) => $"{a.Type} {a.Value}")], 
+                tempReg, 
+                conv, 
+                true
+            );
+
+            Emitter.WriteLine(indirectCall.Formulate());
+
+            if (!IsVoid(returnType))
+                Push(new(tempReg, returnType, false));
         }
 
         LLVMObject ConvertValueToType(LLVMObject value, string targetType)

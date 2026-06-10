@@ -53,7 +53,10 @@ namespace IL2LLVM.Compiler
                 var def = method.Resolve();
                 return Mangle(def);
             }
-            catch (Exception) {}
+            catch (Exception)
+            {
+                Console.WriteLine($"WARNING: Method '{method.FullName}' is not present in the provided assemblies. Please provide a valid assembly with this definition OR define a plug.");
+            }
 
             if (plugReference.TryGetValue(method.FullName, out MethodDefinition? plugName) && plugName != null)
             {
@@ -87,7 +90,8 @@ namespace IL2LLVM.Compiler
         {
 
             methodName = declaringTypeName + "." + methodName;
-            methodName = methodName.Replace("`", ".bt."); // Sanitize generics
+            methodName = methodName.Replace("`", ".."); // Sanitize generics
+            methodName = methodName.Replace('/', '$'); // Nested Classes
 
             var parameterList = parameters.ToArray();
             if (parameterList.Length == 0)

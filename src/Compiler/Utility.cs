@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Numerics;
+using Mono.Cecil;
 
 namespace IL2LLVM.Compiler
 {
@@ -124,6 +125,20 @@ namespace IL2LLVM.Compiler
             int nextPowerOf8Exponent = (nextPowerOf2Exponent + 2) / 3;
 
             return 1U << (nextPowerOf8Exponent * 3);
+        }
+
+        public static string GetLLVMConvention(MethodCallingConvention conv)
+        {
+            return conv switch
+            {
+                MethodCallingConvention.Default => "",
+                MethodCallingConvention.C => "ccc",
+                MethodCallingConvention.StdCall => "x86_stdcallcc",
+                MethodCallingConvention.ThisCall => "x86_thiscallcc",
+                MethodCallingConvention.FastCall => "fastcc",
+                MethodCallingConvention.VarArg => "",
+                _ => throw new NotSupportedException($"Unsupported calling convention: {conv}")
+            };
         }
     }
 }
