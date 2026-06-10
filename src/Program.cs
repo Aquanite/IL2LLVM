@@ -228,16 +228,17 @@ namespace IL2LLVM
 
         private static void PrintUsage()
         {
-            Console.WriteLine("Usage: IL2LLVM <input_file> [-o <output_file>]");
+            Console.WriteLine("Usage: IL2LLVM [options] <input_assembly...> -o <output_file>");
             Console.WriteLine("Options:");
-            Console.WriteLine("  -h, --help      Show this help message");
-            Console.WriteLine("  -v, --version   Show version information");
-            Console.WriteLine("  -o <file>       Specify output file (default: <input_file>.ll)");
-            Console.WriteLine("  --ptr-width <n> Set pointer width (4 or 8, default: platform pointer width)");
-            Console.WriteLine("  --target <t>    Set target double (e.g. x86_64-linux, aarch64-darwin, etc.)");
-            Console.WriteLine("  --unicode       Use Unicode (UTF-16) for string literals (default: false)");
-            Console.WriteLine("  --bundle-corelib Bundle the core library into the output (default: false)");
-            Console.WriteLine("  --targets       List supported target doubles");
+            Console.WriteLine("  -h, --help            Show this help message");
+            Console.WriteLine("  -v, --version         Show version information");
+            Console.WriteLine("  -o <file>             Specify output file (default: out.ll)");
+            Console.WriteLine("  --target <t>          Set target platform (e.g. x86_64-linux, aarch64-darwin)");
+            Console.WriteLine("  --targets             List all supported target platforms");
+            Console.WriteLine("  --ptr-width <n>       Set pointer width in bytes (4 or 8)");
+            Console.WriteLine("  --native-word <n>     Set native machine word width in bytes (4 or 8)");
+            Console.WriteLine("  --unicode             Use Unicode (UTF-16) for string literals (default: ASCII)");
+            Console.WriteLine("  --bundle-corelib      Bundle the core library into the output");
         }
 
         private static void PrintVersion()

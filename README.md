@@ -8,11 +8,15 @@ IL2LLVM [options] <input assembly> -o <output file>
 ```
 
 ### Options
-- `--ptr-width <bytes>`: Specify the pointer width (e.g., 4 or 8). Default is the pointer width of the host platform.
-- `--bundle-corelib`: Bundle the .NET Core library into the output. This will increase the output size but allows the generated code to run without requiring a separate .NET runtime.
-- `--unicode`: Use Unicode encoding for string literals in the generated LLVM IR. By default, IL2LLVM uses ASCII encoding.
-- `-h`, `--help`: Display help information.
-- `-v`, `--version`: Display version information.
+- `-o <file>`: Specify the output file path (default: `out.ll`).
+- `--target <triple>`: Set the target platform triple (e.g., `x86_64-linux`, `aarch64-darwin`). If omitted, it defaults to an auto-detected triple based on the host OS.
+- `--targets`: List all supported target platform triples and exit.
+- `--ptr-width <bytes>`: Specify the pointer width in bytes (`4` or `8`). Default is inferred from the target platform or host platform.
+- `--native-word <bytes>`: Specify the native machine word size in bytes (`4` or `8`). Default matches the pointer width.
+- `--bundle-corelib`: Bundle the .NET Core library into the output to run without requiring a separate .NET runtime.
+- `--unicode`: Use Unicode (UTF-16) encoding for string literals in the generated LLVM IR (default: ASCII).
+- `-h`, `--help`: Display help and usage information.
+- `-v`, `--version`: Display version and runtime platform information.
 
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details
