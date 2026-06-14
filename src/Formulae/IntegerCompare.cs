@@ -8,7 +8,8 @@ namespace IL2LLVM.Formulae
         string type,
         string op1,
         string op2,
-        string returnValue
+        string returnValue,
+        bool isUnsigned = false
     ) : Formula
     {
         private readonly LLVMComparison _predicate = predicate;
@@ -16,10 +17,11 @@ namespace IL2LLVM.Formulae
         private readonly string _op1 = op1;
         private readonly string _op2 = op2;
         private readonly string _returnValue = returnValue; 
+        private readonly bool _isUnsigned = isUnsigned;
 
         public override string Formulate()
         {
-            return $"    {_returnValue} = icmp {_predicate.Flatten()} {_type} {_op1}, {_op2}";
+            return $"    {_returnValue} = icmp {_predicate.Flatten(_isUnsigned)} {_type} {_op1}, {_op2}";
         }
 
         public static string Formulate(
@@ -27,10 +29,11 @@ namespace IL2LLVM.Formulae
             string type,
             string op1,
             string op2,
-            string returnValue
+            string returnValue,
+            bool isUnsigned = false
         )
         {
-            return $"    {returnValue} = icmp {predicate.Flatten()} {type} {op1}, {op2}";
+            return $"    {returnValue} = icmp {predicate.Flatten(isUnsigned)} {type} {op1}, {op2}";
         }
     }
 }

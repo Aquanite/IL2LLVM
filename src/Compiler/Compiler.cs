@@ -1,10 +1,7 @@
-using System.Collections.Frozen;
 using System.Globalization;
-using System.Reflection.PortableExecutable;
 using System.Text;
 using IL2LLVM.Formulae;
 using IL2LLVM.ILException;
-using Microsoft.VisualBasic;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Cecil.Rocks;
@@ -32,9 +29,12 @@ namespace IL2LLVM.Compiler
         private Dictionary<Instruction, string>? instructionLabels;
         private readonly List<string>? declareLabels;
         private readonly List<string>? calledCctors;
+        private readonly Dictionary<string, int> structDefinitions;
         private MethodDefinition currentMethod;
         private readonly Dictionary<Code, Action<Instruction>> instructionHandlers;
         private readonly List<string> allCctors;
+        private bool overflowCheck = false;
+        private bool exportRuntimeOverflow = true;
         private static readonly Dictionary<string, string> targetMatch = new Dictionary<string, string>
         {
             ["i686-windows"]    = "i686-pc-windows-msvc",
@@ -83,6 +83,7 @@ namespace IL2LLVM.Compiler
             calledCctors = [];
             allCctors = [];
             currentMethod = null!; // Is okay because it's not used until it IS set
+            structDefinitions = [];
         }
 
         private StreamWriter Emitter => emitter ?? throw new InvalidOperationException("Emitter not initialized.");
@@ -93,8 +94,9 @@ namespace IL2LLVM.Compiler
         private List<string> DeclareLabels => declareLabels ?? throw new InvalidOperationException("Declare labels not initialized.");
         private List<string> CalledCctors => calledCctors ?? throw new InvalidOperationException("CCTORs called not initialized.");
         private List<string> AllCctors => allCctors ?? throw new InvalidOperationException("All CCTORs called not initialized.");
+        private Dictionary<string, int> StructDefinitions => structDefinitions ?? throw new InvalidOperationException("Struct Definitions are not initialized");
         private MethodDefinition CurrentMethod => currentMethod ?? throw new InvalidOperationException("Current Method not initialized.");
-        private Dictionary<string, string> TargetMatch => targetMatch ?? throw new InvalidOperationException("Target Match not initialized.");
+        private static Dictionary<string, string> TargetMatch => targetMatch ?? throw new InvalidOperationException("Target Match not initialized.");
 
         private void EmitCorelibIfNeeded() 
         {
@@ -111,6 +113,7 @@ namespace IL2LLVM.Compiler
             {
                 Emitter.WriteLine(label);
             }
+            Emitter.WriteLine($"declare void @llvm.memset.p0.i{ptrWidth * 8}(ptr nocapture writeonly, i8, i{ptrWidth * 8}, i1 immarg)");
             Emitter.WriteLine("; DECLARE END\n");
         }
 
@@ -211,8 +214,31 @@ namespace IL2LLVM.Compiler
                                     Mangler.AddPlugReference(GetPlugReference(method)!, method);
                                     Console.WriteLine($"INFO: Added PlugReference: \u001b[33m'{GetPlugReference(method)!}'\u001b[0m to \u001b[32m'{method.FullName}'\u001b[0m");
                                 }
+                                if (IsExport(method))
+                                {
+                                    Mangler.AddExport(method, GetExportName(method)!);
+                                    Console.WriteLine($"INFO: Added Export:        \u001b[33m'{method.FullName}'\u001b[0m as \u001b[32m'{GetExportName(method)!}'\u001b[0m");
+
+                                    if (GetExportName(method) == "__runtime_overflow_occured")
+                                    {
+                                        exportRuntimeOverflow = false;
+                                        Console.WriteLine($"INFO: Detected user-defined overflow handler, skipping export of runtime overflow handler");
+                                    }
+                                }
                             }
                         }
+                    }
+
+                    var customStructs = namespaceGroups
+                        .SelectMany(group => group) 
+                        .Where(t => t.IsValueType && !t.IsPrimitive && t.FullName != "System.Void");
+
+                    foreach (var structure in customStructs)
+                    {
+                        string structName = Mangler.Mangle(structure);
+                        int structSize = GetTypeByteSize(structure);
+                        
+                        Emitter.WriteLine($"%{structName} = type [{structSize} x i8]");
                     }
 
                     foreach (var namespaceGroup in namespaceGroups)
@@ -228,9 +254,15 @@ namespace IL2LLVM.Compiler
 
                             foreach (var field in type.Fields)
                             {
+                                // Check if it is a field in a struct
+                                if (type.IsValueType && !type.IsPrimitive && type.FullName != "System.Void")
+                                    continue;
+
                                 string fieldName = Mangler.Mangle(field);
                                 string fieldType = GetVarType(field.FieldType);
-                                Emitter.WriteLine($"@{fieldName} = global {fieldType} 0, align {GetAlignmentForType(fieldType)}");
+                                bool isConstant = field.IsLiteral && field.HasConstant;
+                                string constantValue = isConstant ? field.Constant!.ToString() ?? "0" : "0";
+                                Emitter.WriteLine($"@{fieldName} = global {fieldType} {constantValue}, align {GetAlignmentForType(fieldType)}");
                             }
 
                             foreach (var method in type.Methods)
@@ -326,9 +358,11 @@ namespace IL2LLVM.Compiler
             {
                 string localType = GetVarType(method.Body.Variables[i].VariableType);
                 LocalVarTypes[i] = localType;
-                Emitter.WriteLine($"    %V_{i} = alloca {localType}, align {GetAlignmentForType(localType)}");
+                Emitter.WriteLine($"    %V_{i} = alloca {localType}");
                 LocalVars[i] = new($"%V_{i}", "ptr", false);
             }
+
+            // Console.WriteLine($"Function: {mangledName}");
 
             // Compile method body
             foreach (var instruction in method.Body.Instructions)
@@ -339,8 +373,10 @@ namespace IL2LLVM.Compiler
                     Emitter.WriteLine($"{label}:");
                 }
                 Emitter.WriteLine($"; IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
-                // Emitter.WriteLine($"; IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
+                // Console.WriteLine($"IL_{instruction.Offset:X8}: {instruction.OpCode.Code}");
+
                 CompileInstruction(instruction);
+                // Console.WriteLine($"Stack: [{string.Join(", ", analyticalStack.Select(o => $"{o.Value} ({o.Type})"))}]\n");
             }
 
             // Emit function footer
@@ -386,6 +422,10 @@ namespace IL2LLVM.Compiler
                 Code.Brfalse_S  => true,
                 Code.Brtrue     => true,
                 Code.Brtrue_S   => true,
+                Code.Ble        => true,
+                Code.Ble_S      => true,
+                Code.Ble_Un_S   => true,
+                Code.Ble_Un     => true,
                 _               => false
             };
         }
@@ -474,12 +514,24 @@ namespace IL2LLVM.Compiler
                 : (string)attr.ConstructorArguments[0].Value;
         }
 
+        private static string? GetExportName(MethodDefinition method)
+        {
+            // Is it an export?
+            var attr = method.CustomAttributes.FirstOrDefault(a =>
+                a.AttributeType.FullName == "IL2LLVM.Attributes.Export");
+
+            return attr is null
+                ? null
+                : (string)attr.ConstructorArguments[0].Value;
+        }
+
         private static bool IsNativeCall(MethodDefinition method) => GetNativeCallName(method) != null;
         private static bool IsNativeCall(MethodReference method) => GetNativeCallName(method) != null;
         private bool IsWindows32() => targetDouble == "i686-windows";
         private static bool IsVoid(string type) => type == "void";
         private static bool IsEntryPoint(MethodDefinition method) => GetEntryPoint(method) != null;
         private static bool IsPlugReference(MethodDefinition method) => GetPlugReference(method) != null;
+        private static bool IsExport(MethodDefinition method) => GetExportName(method) != null;
 
         private static string ToLLVMUnicodeString(string str)
         {
@@ -497,107 +549,126 @@ namespace IL2LLVM.Compiler
         {
             return new Dictionary<Code, Action<Instruction>>
             {
-                [Code.Nop]          = _ => {},
-                [Code.Break]        = _ => Emitter.WriteLine(Call.Formulate("void", "llvm.debugtrap", [])),
-                [Code.Ldarg_0]      = _ => LDARG(0),
-                [Code.Ldarg_1]      = _ => LDARG(1),
-                [Code.Ldarg_2]      = _ => LDARG(2),
-                [Code.Ldarg_3]      = _ => LDARG(3),
-                [Code.Ldloc_0]      = _ => LDLOC(0),
-                [Code.Ldloc_1]      = _ => LDLOC(1),
-                [Code.Ldloc_2]      = _ => LDLOC(2),
-                [Code.Ldloc_3]      = _ => LDLOC(3),
-                [Code.Stloc_0]      = _ => STLOC(0),
-                [Code.Stloc_1]      = _ => STLOC(1),
-                [Code.Stloc_2]      = _ => STLOC(2),
-                [Code.Stloc_3]      = _ => STLOC(3),
-                [Code.Ldarg_S]      = instruction => LDARG((ushort)instruction.Operand),
-                [Code.Ldarga_S]     = instruction => LDARGA((VariableDefinition)instruction.Operand),
-                [Code.Ldloc_S]      = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
-                [Code.Ldloca_S]     = instruction => LDLOCA((VariableDefinition)instruction.Operand),
-                [Code.Ldarg]        = instruction => LDARG((ushort)instruction.Operand),
-                [Code.Ldarga]       = instruction => LDARGA((VariableDefinition)instruction.Operand),
-                [Code.Ldloc]        = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
-                [Code.Ldloca]       = instruction => LDLOCA((VariableDefinition)instruction.Operand),
-                [Code.Stloc]        = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
-                [Code.Stloc_S]      = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
-                [Code.Ldnull]       = _ => LDNULL(),
-                [Code.Ldc_I4_M1]    = _ => LDC_I4(-1),
-                [Code.Ldc_I4_0]     = _ => LDC_I4(0),
-                [Code.Ldc_I4_1]     = _ => LDC_I4(1),
-                [Code.Ldc_I4_2]     = _ => LDC_I4(2),
-                [Code.Ldc_I4_3]     = _ => LDC_I4(3),
-                [Code.Ldc_I4_4]     = _ => LDC_I4(4),
-                [Code.Ldc_I4_5]     = _ => LDC_I4(5),
-                [Code.Ldc_I4_6]     = _ => LDC_I4(6),
-                [Code.Ldc_I4_7]     = _ => LDC_I4(7),
-                [Code.Ldc_I4_8]     = _ => LDC_I4(8),
-                [Code.Ldc_I4_S]     = instruction => LDC_I4_S((sbyte)instruction.Operand),
-                [Code.Ldc_I4]       = instruction => LDC_I4((int)instruction.Operand),
-                [Code.Ldc_I8]       = instruction => LDC_I8((long)instruction.Operand),
-                [Code.Ldc_R4]       = instruction => LDC_R4((float)instruction.Operand),
-                [Code.Ldc_R8]       = instruction => LDC_R8((double)instruction.Operand),
-                [Code.Dup]          = _ => DUP(),
-                [Code.Pop]          = _ => POP(),
-                [Code.Call]         = instruction => CALL((MethodReference)instruction.Operand),
-                [Code.Calli]        = instruction => CALLI((CallSite)instruction.Operand),
-                [Code.Add]          = _ => ADD(),
-                [Code.Sub]          = _ => SUB(),
-                [Code.Stsfld]       = instruction => STSFLD((FieldDefinition)instruction.Operand),
-                [Code.Ldsfld]       = instruction => LDSFLD((FieldDefinition)instruction.Operand),
-                [Code.Ret]          = _ => RET(),
-                [Code.Volatile]     = _ => VOLATILE(),
-                [Code.Br_S]         = instruction => BR(instruction.Operand),
-                [Code.Br]           = instruction => BR(instruction.Operand),
-                [Code.Brfalse_S]    = instruction => BRFALSE(instruction.Operand),
-                [Code.Brfalse]      = instruction => BRFALSE(instruction.Operand),
-                [Code.Brtrue]       = instruction => BRTRUE(instruction.Operand),
-                [Code.Brtrue_S]     = instruction => BRTRUE(instruction.Operand),
-                [Code.Ceq]          = _ => CEQ(),
-                [Code.Clt]          = _ => CLT(),
-                [Code.Cgt]          = _ => CGT(),
-                [Code.Ldstr]        = instruction => LDSTR((string)instruction.Operand),
-                [Code.Conv_U]       = _ => CONV_U(),
-                [Code.Conv_I]       = _ => CONV_I(),
-                [Code.Conv_U8]      = _ => CONV_U8(),
-                [Code.Conv_I8]      = _ => CONV_I8(),
-                [Code.Conv_U4]      = _ => CONV_U4(),
-                [Code.Conv_I4]      = _ => CONV_I4(),
-                [Code.Conv_U2]      = _ => CONV_U2(),
-                [Code.Conv_I2]      = _ => CONV_I2(),
-                [Code.Conv_U1]      = _ => CONV_U1(),
-                [Code.Conv_I1]      = _ => CONV_I1(),
-                [Code.Conv_R4]      = _ => CONV_R4(),
-                [Code.Conv_R8]      = _ => CONV_R8(),
-                [Code.Stind_I8]     = _ => STIND_I8(),
-                [Code.Stind_I1]     = _ => STIND_I1(),
-                [Code.Stind_I2]     = _ => STIND_I2(),
-                [Code.Stind_I4]     = _ => STIND_I4(),
-                [Code.Stind_I]      = _ => STIND_I(),
-                [Code.Stind_R4]     = _ => STIND_R4(),
-                [Code.Stind_R8]     = _ => STIND_R8(),
-                [Code.Ldind_I8]     = _ => LDIND_I8(),
-                [Code.Ldind_I1]     = _ => LDIND_I1(),
-                [Code.Ldind_I2]     = _ => LDIND_I2(),
-                [Code.Ldind_I4]     = _ => LDIND_I4(),
-                [Code.Ldind_I]      = _ => LDIND_I(),
-                [Code.Ldind_R4]     = _ => LDIND_R4(),
-                [Code.Ldind_R8]     = _ => LDIND_R8(),
-                [Code.Ldind_U1]     = _ => LDIND_U1(),
-                [Code.Ldind_U2]     = _ => LDIND_U2(),
-                [Code.Ldind_U4]     = _ => LDIND_U4(),
-                [Code.Ldind_Ref]    = _ => LDIND_REF(),
-                [Code.Stind_Ref]    = _ => STIND_REF(),
+                [Code.Nop]              = _ => {},
+                [Code.Break]            = _ => Emitter.WriteLine(Call.Formulate("void", "llvm.debugtrap", [])),
+                [Code.Ldarg_0]          = _ => LDARG(0),
+                [Code.Ldarg_1]          = _ => LDARG(1),
+                [Code.Ldarg_2]          = _ => LDARG(2),
+                [Code.Ldarg_3]          = _ => LDARG(3),
+                [Code.Ldloc_0]          = _ => LDLOC(0),
+                [Code.Ldloc_1]          = _ => LDLOC(1),
+                [Code.Ldloc_2]          = _ => LDLOC(2),
+                [Code.Ldloc_3]          = _ => LDLOC(3),
+                [Code.Stloc_0]          = _ => STLOC(0),
+                [Code.Stloc_1]          = _ => STLOC(1),
+                [Code.Stloc_2]          = _ => STLOC(2),
+                [Code.Stloc_3]          = _ => STLOC(3),
+                [Code.Ldarg_S]          = instruction => LDARG((ushort)instruction.Operand),
+                [Code.Ldarga_S]         = instruction => LDARGA((VariableDefinition)instruction.Operand),
+                [Code.Ldloc_S]          = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
+                [Code.Ldloca_S]         = instruction => LDLOCA((VariableDefinition)instruction.Operand),
+                [Code.Ldarg]            = instruction => LDARG((ushort)instruction.Operand),
+                [Code.Ldarga]           = instruction => LDARGA((VariableDefinition)instruction.Operand),
+                [Code.Ldloc]            = instruction => LDLOC((ushort)((VariableDefinition)instruction.Operand).Index),
+                [Code.Ldloca]           = instruction => LDLOCA((VariableDefinition)instruction.Operand),
+                [Code.Stloc]            = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
+                [Code.Stloc_S]          = instruction => STLOC((ushort)((VariableDefinition)instruction.Operand).Index),
+                [Code.Ldnull]           = _ => LDNULL(),
+                [Code.Ldc_I4_M1]        = _ => LDC_I4(-1),
+                [Code.Ldc_I4_0]         = _ => LDC_I4(0),
+                [Code.Ldc_I4_1]         = _ => LDC_I4(1),
+                [Code.Ldc_I4_2]         = _ => LDC_I4(2),
+                [Code.Ldc_I4_3]         = _ => LDC_I4(3),
+                [Code.Ldc_I4_4]         = _ => LDC_I4(4),
+                [Code.Ldc_I4_5]         = _ => LDC_I4(5),
+                [Code.Ldc_I4_6]         = _ => LDC_I4(6),
+                [Code.Ldc_I4_7]         = _ => LDC_I4(7),
+                [Code.Ldc_I4_8]         = _ => LDC_I4(8),
+                [Code.Ldc_I4_S]         = instruction => LDC_I4_S((sbyte)instruction.Operand),
+                [Code.Ldc_I4]           = instruction => LDC_I4((int)instruction.Operand),
+                [Code.Ldc_I8]           = instruction => LDC_I8((long)instruction.Operand),
+                [Code.Ldc_R4]           = instruction => LDC_R4((float)instruction.Operand),
+                [Code.Ldc_R8]           = instruction => LDC_R8((double)instruction.Operand),
+                [Code.Dup]              = _ => DUP(),
+                [Code.Pop]              = _ => POP(),
+                [Code.Call]             = instruction => CALL((MethodReference)instruction.Operand),
+                [Code.Calli]            = instruction => CALLI((CallSite)instruction.Operand),
+                [Code.Add]              = _ => ADD(),
+                [Code.Sub]              = _ => SUB(),
+                [Code.Or]               = _ => OR(),
+                [Code.Stsfld]           = instruction => STSFLD((FieldDefinition)instruction.Operand),
+                [Code.Ldsfld]           = instruction => LDSFLD((FieldDefinition)instruction.Operand),
+                [Code.Ret]              = _ => RET(),
+                [Code.Volatile]         = _ => VOLATILE(),
+                [Code.Br_S]             = instruction => BR(instruction.Operand),
+                [Code.Br]               = instruction => BR(instruction.Operand),
+                [Code.Brfalse_S]        = instruction => BRFALSE(instruction.Operand),
+                [Code.Brfalse]          = instruction => BRFALSE(instruction.Operand),
+                [Code.Brtrue]           = instruction => BRTRUE(instruction.Operand),
+                [Code.Brtrue_S]         = instruction => BRTRUE(instruction.Operand),
+                [Code.Ble]              = instruction => BLE(instruction.Operand),
+                [Code.Ble_S]            = instruction => BLE_UN(instruction.Operand),
+                [Code.Ble_Un_S]         = instruction => BLE_UN(instruction.Operand),
+                [Code.Ceq]              = _ => CEQ(),
+                [Code.Clt]              = _ => CLT(),
+                [Code.Cgt]              = _ => CGT(),
+                [Code.Ldstr]            = instruction => LDSTR((string)instruction.Operand),
+                [Code.Conv_U]           = _ => CONV_U(),
+                [Code.Conv_I]           = _ => CONV_I(),
+                [Code.Conv_U8]          = _ => CONV_U8(),
+                [Code.Conv_I8]          = _ => CONV_I8(),
+                [Code.Conv_U4]          = _ => CONV_U4(),
+                [Code.Conv_I4]          = _ => CONV_I4(),
+                [Code.Conv_U2]          = _ => CONV_U2(),
+                [Code.Conv_I2]          = _ => CONV_I2(),
+                [Code.Conv_U1]          = _ => CONV_U1(),
+                [Code.Conv_I1]          = _ => CONV_I1(),
+                [Code.Conv_R4]          = _ => CONV_R4(),
+                [Code.Conv_R8]          = _ => CONV_R8(),
+                [Code.Stind_I8]         = _ => STIND_I8(),
+                [Code.Stind_I1]         = _ => STIND_I1(),
+                [Code.Stind_I2]         = _ => STIND_I2(),
+                [Code.Stind_I4]         = _ => STIND_I4(),
+                [Code.Stind_I]          = _ => STIND_I(),
+                [Code.Stind_R4]         = _ => STIND_R4(),
+                [Code.Stind_R8]         = _ => STIND_R8(),
+                [Code.Ldind_I8]         = _ => LDIND_I8(),
+                [Code.Ldind_I1]         = _ => LDIND_I1(),
+                [Code.Ldind_I2]         = _ => LDIND_I2(),
+                [Code.Ldind_I4]         = _ => LDIND_I4(),
+                [Code.Ldind_I]          = _ => LDIND_I(),
+                [Code.Ldind_R4]         = _ => LDIND_R4(),
+                [Code.Ldind_R8]         = _ => LDIND_R8(),
+                [Code.Ldind_U1]         = _ => LDIND_U1(),
+                [Code.Ldind_U2]         = _ => LDIND_U2(),
+                [Code.Ldind_U4]         = _ => LDIND_U4(),
+                [Code.Ldind_Ref]        = _ => LDIND_REF(),
+                [Code.Stind_Ref]        = _ => STIND_REF(),
+                [Code.Add_Ovf]          = _ => ADD_OVF(),
+                [Code.Conv_Ovf_U1_Un]   = _ => CONV_OVF_U1_UN(),
+                [Code.Conv_Ovf_I8_Un]   = _ => CONV_OVF_I1_UN(),
+                [Code.Conv_Ovf_U1]      = _ => CONV_OVF_U1(),
+                [Code.Initobj]          = instruction => INITOBJ((TypeReference)instruction.Operand),
+                [Code.Stfld]            = instruction => STFLD((FieldReference)instruction.Operand),
+                [Code.Ldfld]            = instruction => LDFLD((FieldReference)instruction.Operand),
+                [Code.Ldflda]           = instruction => LDFLDA((FieldReference)instruction.Operand),
+            };
+        }
+
+        private bool IsUnsigned(TypeReference type)
+        {
+            return type.FullName switch
+            {
+                "System.Byte"   => true,
+                "System.UInt16" => true,
+                "System.UInt32" => true,
+                "System.UInt64" => true,
+                _               => false
             };
         }
 
         private string GetVarType(TypeReference variableType)
         {
-            if (variableType.IsPointer || variableType.IsByReference || variableType.IsFunctionPointer)
-            {
-                return "ptr";
-            }
-
             string typeName = variableType.FullName.Split(' ')[0];
 
             return typeName switch
@@ -616,9 +687,74 @@ namespace IL2LLVM.Compiler
                 "System.Double"  => "double",
                 "System.String"  => "ptr",
                 "System.IntPtr"  => TargetNativeIntType,
-                _                => throw new NotSupportedException($"Unsupported variable type: {variableType.FullName}")
+                _                => "%" + Mangler.Mangle(variableType)
             };
         }
+
+        public  int GetPrimitiveByteSize(TypeReference type)
+        {
+            return type.FullName switch
+            {
+                "System.Boolean" or "System.Byte"    or "System.SByte"  => 1,
+                "System.Int16"   or "System.UInt16"                     => 2,
+                "System.Int32"   or "System.UInt32"  or "System.Single" => 4,
+                "System.Int64"   or "System.UInt64"  or "System.Double" => 8,
+                "System.IntPtr"  or "System.UIntPtr"                    => nativeWord,
+                _ => -1 // Not a primitive
+            };
+        }
+
+        public int GetTypeByteSize(TypeReference typeRef)
+        {
+            int primitiveSize = GetPrimitiveByteSize(typeRef);
+            if (primitiveSize != -1) return primitiveSize;
+
+            TypeDefinition typeDef = typeRef.Resolve();
+            if (typeDef == null) return 0;
+
+            if (typeDef.ClassSize > 0) return typeDef.ClassSize;
+
+            int totalSize = 0;
+            foreach (var field in typeDef.Fields)
+            {
+                if (field.IsStatic) continue;
+                totalSize += GetTypeByteSize(field.FieldType);
+            }
+            return totalSize;
+        }
+
+        public int GetFieldByteOffset(FieldReference fieldRef)
+        {
+            FieldDefinition fieldDef = fieldRef.Resolve();
+            if (fieldDef == null)
+                throw new InvalidOperationException("Expected assembly structure to be present.");
+
+            TypeDefinition parentStruct = fieldDef.DeclaringType;
+
+            if (fieldDef.Offset != -1)
+            {
+                return fieldDef.Offset;
+            }
+
+            int currentOffset = 0;
+
+            foreach (FieldDefinition f in parentStruct.Fields)
+            {
+                // Skip static
+                if (f.IsStatic) continue;
+
+                if (f.FullName == fieldDef.FullName)
+                {
+                    return currentOffset;
+                }
+
+                int fieldSize = GetTypeByteSize(f.FieldType);
+                currentOffset += fieldSize;
+            }
+
+            throw new InvalidOperationException($"Field {fieldRef.Name} not found in parent struct.");
+        }
+
 
         int GetAlignmentForType(string type)
         {
@@ -648,6 +784,14 @@ namespace IL2LLVM.Compiler
                 "ptr"    => false, // Cant tell what it points to, so skip for now
                 _        => false
             };
+        }
+
+        static bool IsPrimative(string type)
+        {
+            if (type.StartsWith('i') || type == "float" || type == "double")
+                return true;
+            
+            return false;
         }
 
         void EmitCorelib()
@@ -680,6 +824,12 @@ namespace IL2LLVM.Compiler
 
         void LDLOC(ushort index)
         {
+            if (!IsPrimative(LocalVarTypes[index]))
+            {
+                Push(new($"%V_{index}", "ptr", false));
+                return; // Forward
+            }
+
             string tempReg = TemporaryRegister();
             Emitter.WriteLine($"    {tempReg} = load {LocalVarTypes[index]}, ptr {LocalVars[index].Value}, align {GetAlignmentForType(LocalVarTypes[index])}");
             Push(new(tempReg, LocalVarTypes[index], false));
@@ -687,8 +837,16 @@ namespace IL2LLVM.Compiler
 
         void STLOC(ushort index)
         {
+            if (!IsPrimative(LocalVarTypes[index]))
+            {
+                string tmp = TemporaryRegister();
+                Emitter.WriteLine($"    {tmp} = load {LocalVarTypes[index]}, ptr {Pop().Value}");
+                Emitter.WriteLine($"    store {LocalVarTypes[index]} {tmp}, ptr %V_{index}");
+                return;
+            }
+
             LLVMObject value = Pop();
-            value = ConvertValueToType(value, LocalVarTypes[index]);
+            value = ConvertValueToType(value, IsPrimative(LocalVarTypes[index]) ? LocalVarTypes[index] : "ptr");
             LLVMObject finalValue = value;
 
             if ((value.Type == "float" || value.Type == "double") && double.TryParse(value.Value, CultureInfo.InvariantCulture, out double doubleValue))
@@ -886,6 +1044,85 @@ namespace IL2LLVM.Compiler
             return;
         }
 
+        void ADD_OVF()
+        {
+
+            if(!overflowCheck)
+            {
+                if (exportRuntimeOverflow)
+                    DeclareLabels.Add("declare void @__runtime_overflow_occured()");
+
+                DeclareLabels.Add("declare { i32, i1 } @llvm.sadd.with.overflow.i32(i32, i32)");
+                DeclareLabels.Add("declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("define void @__runtime_swilloverflow_32(i32 %a, i32 %b) {");
+                DeclareLabels.Add("entry:");
+                DeclareLabels.Add("    %res = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %a, i32 %b)");
+                DeclareLabels.Add("    %is_overflow = extractvalue { i32, i1 } %res, 1");
+                DeclareLabels.Add("    br i1 %is_overflow, label %overflow_detected, label %no_overflow");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("overflow_detected:");
+                DeclareLabels.Add("    call void @__runtime_overflow_occured()");
+                DeclareLabels.Add("    ret void");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("no_overflow:");
+                DeclareLabels.Add("    ret void");
+                DeclareLabels.Add("}");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("define void @__runtime_swilloverflow_64(i64 %a, i64 %b) {");
+                DeclareLabels.Add("entry:");
+                DeclareLabels.Add("    %res = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %a, i64 %b)");
+                DeclareLabels.Add("    %is_overflow = extractvalue { i64, i1 } %res, 1");
+                DeclareLabels.Add("    br i1 %is_overflow, label %overflow_detected, label %no_overflow");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("overflow_detected:");
+                DeclareLabels.Add("    call void @__runtime_overflow_occured()");
+                DeclareLabels.Add("    ret void");
+                DeclareLabels.Add("");
+                DeclareLabels.Add("no_overflow:");
+                DeclareLabels.Add("    ret void");
+                DeclareLabels.Add("}");
+
+                overflowCheck = true;
+            }
+            
+            LLVMObject b = Pop();
+            LLVMObject a = Pop();
+
+            Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+            if (a.Type[0] == 'f' || a.Type[0] == 'd' || b.Type[0] == 'f' || b.Type[0] == 'd')
+                throw new InvalidOpcodeException("ADD.OVF Cannot accept floats.");
+
+            if (bigger == 1 && a.Type[0] == 'i') // a
+            {
+                Push(b);
+                EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                Push(a);
+                ADD_OVF(); // Try again
+                return;
+            }
+            else if (bigger == 2 && a.Type[0] == 'i') // b
+            {
+                Push(b);
+                Push(a);
+                EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                ADD_OVF(); // Try again
+                return;
+            }
+
+            string type = a.Type;
+            string checkFunction = $"__runtime_swilloverflow_{(type == "i32" ? "32" : "64")}";
+
+            Emitter.WriteLine(Call.Formulate("void", checkFunction, [$"{type} {a.Value}", $"{type} {b.Value}"]));
+
+            // If that passes, then we are good to add
+            Push(a);
+            Push(b);
+            ADD();
+            return;
+        }
+
         void SUB()
         {
             LLVMObject b = Pop();
@@ -904,6 +1141,22 @@ namespace IL2LLVM.Compiler
                 Push(new(tempReg, a.Type, false));
                 return;
             }
+        }
+
+        void OR()
+        {
+            LLVMObject b = Pop();
+            LLVMObject a = Pop();
+
+            if (a.Type == b.Type && a.Type.StartsWith("i"))
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = or {a.Type} {a.Value}, {b.Value}");
+                Push(new(tempReg, a.Type, false));
+                return;
+            }
+
+            throw new InvalidOpcodeException($"OR operator requires matching integer types! Got {a.Type} and {b.Type}");
         }
 
         void STSFLD(FieldDefinition field)
@@ -1026,6 +1279,193 @@ namespace IL2LLVM.Compiler
             throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}");
         }
 
+        void BLE(object operand)
+        {
+            if (!IsInstruction(operand))
+                throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}"); 
+
+            if (InstructionLabels.TryGetValue((Instruction)operand, out string? label) && !string.IsNullOrEmpty(label))
+            {
+                LLVMObject b = Pop();
+                LLVMObject a = Pop();
+
+                string br = TemporaryBranch();
+                string tmp = TemporaryRegister();
+
+                Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+                if (bigger == 1 && a.Type[0] == 'i') // a
+                {
+                    Push(b);
+                    EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), a.isUnsigned);
+                    Push(a);
+                    BLE(operand); // Try again
+                    return;
+                }
+                else if (bigger == 2 && a.Type[0] == 'i') // b
+                {
+                    Push(b);
+                    Push(a);
+                    EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), b.isUnsigned);
+                    BLE(operand); // Try again
+                    return;
+                }
+
+                if (IsFloat(a.Type) || IsFloat(b.Type))
+                {
+                    Emitter.WriteLine(FloatCompare.Formulate(LLVMComparison.UnorderedLessThanOrEqual, a.Type, a.Value, b.Value, tmp));
+                }
+                else
+                {
+                    Emitter.WriteLine(IntegerCompare.Formulate(LLVMComparison.LessThanOrEqual, a.Type, a.Value, b.Value, tmp, a.isUnsigned || b.isUnsigned));
+                }
+
+                Emitter.WriteLine($"    br i1 {tmp}, label %{label}, label %{br}");
+                Emitter.WriteLine($"{br}:");
+
+                return;
+            }
+
+            throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}");
+        }
+
+        void BLE_UN(object operand)
+        {
+            if (!IsInstruction(operand))
+                throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}"); 
+
+            if (InstructionLabels.TryGetValue((Instruction)operand, out string? label) && !string.IsNullOrEmpty(label))
+            {
+                LLVMObject b = Pop();
+                LLVMObject a = Pop();
+
+                string br = TemporaryBranch();
+                string tmp = TemporaryRegister();
+
+                Utility.GetBiggerType(a.Type, b.Type, out byte bigger);
+
+                if (bigger == 1 && a.Type[0] == 'i') // a
+                {
+                    Push(b);
+                    EmitIntegerConv(a.Type, int.Parse(a.Type[1..]), true);
+                    Push(a);
+                    BLE(operand); // Try again
+                    return;
+                }
+                else if (bigger == 2 && a.Type[0] == 'i') // b
+                {
+                    Push(b);
+                    Push(a);
+                    EmitIntegerConv(b.Type, int.Parse(b.Type[1..]), true);
+                    BLE(operand); // Try again
+                    return;
+                }
+
+                if (IsFloat(a.Type) || IsFloat(b.Type))
+                {
+                    Emitter.WriteLine(FloatCompare.Formulate(LLVMComparison.UnorderedLessThanOrEqual, a.Type, a.Value, b.Value, tmp));
+                }
+                else
+                {
+                    Emitter.WriteLine(IntegerCompare.Formulate(LLVMComparison.LessThanOrEqual, a.Type, a.Value, b.Value, tmp, true));
+                }
+
+                return;
+            }
+
+            throw new InvalidOpcodeException($"Invalid Branch Instruction! typeof = {operand.GetType()}");
+        }
+
+        void CONV_OVF_U1()
+        {
+            LLVMObject value = Pop();
+            if (value.Type == "i8" && value.isUnsigned) { Push(value); return; }
+            
+            // If int
+            if (value.Type.StartsWith('i'))
+            {
+                Push(value);
+                EmitIntegerConv("i8", 8, true);
+                return;
+            }
+            else if (value.Type == "float" || value.Type == "double")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = fptoui {value.Type} {value.Value} to i8");
+                Push(new(tempReg, "i8", true));
+                return;
+            }
+            else if (value.Type == "ptr")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to i8");
+                Push(new(tempReg, "i8", true));
+                return;
+            }
+
+            throw new InvalidOpcodeException($"Cannot convert type {value.Type} to i8 for conv.ovf.u1");
+        }
+
+        void CONV_OVF_U1_UN()
+        {
+            LLVMObject value = Pop();
+            if (value.Type == "i8" && value.isUnsigned) { Push(value); return; }
+            
+            // If int
+            if (value.Type.StartsWith('i'))
+            {
+                Push(value);
+                EmitIntegerConv("i8", 8, true);
+                return;
+            }
+            else if (value.Type == "float" || value.Type == "double")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = fptoui {value.Type} {value.Value} to i8");
+                Push(new(tempReg, "i8", true));
+                return;
+            }
+            else if (value.Type == "ptr")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to i8");
+                Push(new(tempReg, "i8", true));
+                return;
+            }
+
+            throw new InvalidOpcodeException($"Cannot convert type {value.Type} to i8 for conv.ovf.u1.un");
+        }
+
+        void CONV_OVF_I1_UN()
+        {
+            LLVMObject value = Pop();
+            if (value.Type == "i8" && !value.isUnsigned) { Push(value); return; }
+            
+            // If int
+            if (value.Type.StartsWith('i'))
+            {
+                Push(value);
+                EmitIntegerConv("i8", 8, false);
+                return;
+            }
+            else if (value.Type == "float" || value.Type == "double")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = fptoui {value.Type} {value.Value} to i8");
+                Push(new(tempReg, "i8", false));
+                return;
+            }
+            else if (value.Type == "ptr")
+            {
+                string tempReg = TemporaryRegister();
+                Emitter.WriteLine($"    {tempReg} = ptrtoint ptr {value.Value} to i8");
+                Push(new(tempReg, "i8", false));
+                return;
+            }
+
+            throw new InvalidOpcodeException($"Cannot convert type {value.Type} to i8 for conv.ovf.i1.un");
+        }
+
         void LDSTR(string value)
         {
             string globalName = $"str_{stringCounter++}";
@@ -1097,6 +1537,26 @@ namespace IL2LLVM.Compiler
             Push(new(tempReg, targetType, targetUnsigned));
         }
 
+        void EmitPointerConv(string targetType)
+        {
+            LLVMObject value = Pop();
+            if (value.Type == targetType) { Push(value); return; }
+            string tempReg = TemporaryRegister();
+            if (value.Type == "ptr")
+            {
+                Emitter.WriteLine($"    {tempReg} = bitcast ptr {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, false));
+                return;
+            }
+            if (value.Type.StartsWith("i"))
+            {
+                Emitter.WriteLine($"    {tempReg} = inttoptr {value.Type} {value.Value} to {targetType}");
+                Push(new(tempReg, targetType, false));
+                return;
+            }
+            throw new InvalidOpcodeException($"Cannot convert type {value.Type} to pointer type {targetType}");
+        }
+
         void CONV_U1() => EmitIntegerConv("i8", 8, true);
         void CONV_I1() => EmitIntegerConv("i8", 8, false);
         void CONV_U2() => EmitIntegerConv("i16", 16, true);
@@ -1147,13 +1607,21 @@ namespace IL2LLVM.Compiler
                 Environment.Exit(-1);
             }
 
-            if (value.Type != "i1")
+            if (value.Type != "i8")
             {
-                Console.WriteLine($"FATAL: Invalid value type for stind.i1: {value.Type}");
-                Environment.Exit(-1);
+                // Conv
+                Push(value);
+                EmitIntegerConv("i8", 8, value.isUnsigned);
+                value = Pop();
+
+                if (value.Type != "i8")
+                {
+                    Console.WriteLine($"FATAL: Invalid value type for stind.i1 after conversion: {value.Type}");
+                    Environment.Exit(-1);
+                }
             }
 
-            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i1 {value.Value}, ptr {address.Value}, align 1");
+            Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i8 {value.Value}, ptr {address.Value}, align 1");
             nextIsVolatile = false;
         }
 
@@ -1170,8 +1638,16 @@ namespace IL2LLVM.Compiler
 
             if (value.Type != "i16")
             {
-                Console.WriteLine($"FATAL: Invalid value type for stind.i2: {value.Type}");
-                Environment.Exit(-1);
+                // Conv
+                Push(value);
+                EmitIntegerConv("i16", 16, value.isUnsigned);
+                value = Pop();
+
+                if (value.Type != "i16")
+                {
+                    Console.WriteLine($"FATAL: Invalid value type for stind.i2 after conversion: {value.Type}");
+                    Environment.Exit(-1);
+                }
             }
 
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i16 {value.Value}, ptr {address.Value}, align 2");
@@ -1191,8 +1667,16 @@ namespace IL2LLVM.Compiler
 
             if (value.Type != "i32")
             {
-                Console.WriteLine($"FATAL: Invalid value type for stind.i4: {value.Type}");
-                Environment.Exit(-1);
+                // Conv
+                Push(value);
+                EmitIntegerConv("i32", 32, value.isUnsigned);
+                value = Pop();
+
+                if (value.Type != "i32")
+                {
+                    Console.WriteLine($"FATAL: Invalid value type for stind.i4 after conversion: {value.Type}");
+                    Environment.Exit(-1);
+                }
             }
 
             Emitter.WriteLine($"    store {(nextIsVolatile ? "volatile" : "")} i32 {value.Value}, ptr {address.Value}, align 4");
@@ -1212,8 +1696,16 @@ namespace IL2LLVM.Compiler
 
             if (value.Type != "i64")
             {
-                Console.WriteLine($"FATAL: Invalid value type for stind.i8: {value.Type}");
-                Environment.Exit(-1);
+                // Conv
+                Push(value);
+                EmitIntegerConv("i64", 64, value.isUnsigned);
+                value = Pop();
+
+                if (value.Type != "i64")
+                {
+                    Console.WriteLine($"FATAL: Invalid value type for stind.i8 after conversion: {value.Type}");
+                    Environment.Exit(-1);
+                }
             }
 
 
@@ -1290,8 +1782,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.i8: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1305,13 +1798,14 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.i1: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
-            Emitter.WriteLine($"    {tempReg} = load i1, ptr {address.Value}, align 1");
-            Push(new(tempReg, "i1", false));
+            Emitter.WriteLine($"    {tempReg} = load i8, ptr {address.Value}, align 1");
+            Push(new(tempReg, "i8", false));
         }
 
         void LDIND_I2()
@@ -1320,8 +1814,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.i2: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1335,8 +1830,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.i4: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1350,8 +1846,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.i: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1395,8 +1892,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.u1: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1412,8 +1910,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.u2: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1429,8 +1928,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.u4: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1446,8 +1946,9 @@ namespace IL2LLVM.Compiler
 
             if (address.Type != "ptr")
             {
-                Console.WriteLine($"FATAL: Invalid address type for ldind.ref: {address.Type}");
-                Environment.Exit(-1);
+                Push(address);
+                EmitPointerConv("ptr");
+                address = Pop();
             }
 
             string tempReg = TemporaryRegister();
@@ -1602,7 +2103,6 @@ namespace IL2LLVM.Compiler
 
         void CALLI(CallSite site)
         {
-            // Support calling convs and emit the conv to llvm ir
             MethodCallingConvention conv = site.CallingConvention;
 
             string returnType = GetVarType(site.ReturnType);
@@ -1627,6 +2127,124 @@ namespace IL2LLVM.Compiler
 
             if (!IsVoid(returnType))
                 Push(new(tempReg, returnType, false));
+        }
+
+        void INITOBJ(TypeReference reference)
+        {
+            int size = GetTypeByteSize(reference);
+
+            if (size == 0)
+                throw new InvalidOpcodeException("INITOBJ Got zero bytes for size of object.");
+            
+            LLVMObject ptr = Pop();
+
+            string mangledName = Mangler.Mangle(reference);
+
+            Call call = new(
+                "void",
+                $"llvm.memset.p0.i{ptrWidth * 8}",
+                [$"ptr {ptr.Value}", "i8 0", $"i{ptrWidth * 8} {size}", "i1 false"]
+            );
+
+            Emitter.WriteLine(call.Formulate());
+        }
+
+        void STFLD(FieldReference reference)
+        {
+            var field = reference.Resolve()
+                ?? throw new InvalidOpcodeException("STFLD expected resolved field, but was left unresolved. Was the target assembly included?");
+
+            string tmp = TemporaryRegister();
+
+            LLVMObject toStore = Pop();
+            LLVMObject ptr = Pop();
+
+            int size = GetTypeByteSize(field.DeclaringType);
+
+            if (size == 0)
+                throw new InvalidOpcodeException("STFLD Got zero bytes for size of object.");
+
+            GetElementPointer elementPointer = new(
+                tmp,
+                "i8",
+                ptr.Value,
+                ["i32 0", $"i32 {GetFieldByteOffset(reference)}"],
+                true,
+                size,
+                false
+            );
+
+            Emitter.WriteLine(elementPointer.Formulate());
+            Emitter.WriteLine($"    store {toStore.Type} {toStore.Value}, ptr {tmp}");
+        }
+
+        void LDFLD(FieldReference reference)
+        {
+            var field = reference.Resolve()
+                ?? throw new InvalidOpcodeException("LDFLD expected resolved field, but was left unresolved. Was the target assembly included?");
+
+            string tmp = TemporaryRegister();
+
+            LLVMObject ptr = Pop();
+
+            int size = GetTypeByteSize(field.DeclaringType);
+
+            if (size == 0)
+                throw new InvalidOpcodeException("LDFLD Got zero bytes for size of object.");
+
+            GetElementPointer elementPointer = new(
+                tmp,
+                "i8",
+                ptr.Value,
+                ["i32 0", $"i32 {GetFieldByteOffset(reference)}"],
+                true,
+                size,
+                false
+            );
+
+            string type = GetVarType(field.FieldType);
+
+            Emitter.WriteLine(elementPointer.Formulate());
+
+            if (!IsPrimative(type))
+            {
+                Push(new(tmp, "ptr", false));
+                return;
+            }
+
+            string toLoad = TemporaryRegister();
+            Emitter.WriteLine($"    {toLoad} = load {type}, ptr {tmp}");
+
+            Push(new(toLoad, type, IsUnsigned(field.FieldType)));
+        }
+
+        void LDFLDA(FieldReference reference)
+        {
+            var field = reference.Resolve()
+                ?? throw new InvalidOpcodeException("LDFLDA expected resolved field, but was left unresolved. Was the target assembly included?");
+
+            string tmp = TemporaryRegister();
+
+            LLVMObject ptr = Pop();
+
+            int size = GetTypeByteSize(field.DeclaringType);
+
+            if (size == 0)
+                throw new InvalidOpcodeException("LDFLD Got zero bytes for size of object.");
+
+            GetElementPointer elementPointer = new(
+                tmp,
+                "i8",
+                ptr.Value,
+                ["i32 0", $"i32 {GetFieldByteOffset(reference)}"],
+                true,
+                size,
+                false
+            );
+
+            Emitter.WriteLine(elementPointer.Formulate());
+
+            Push(new(tmp, "ptr", false));
         }
 
         LLVMObject ConvertValueToType(LLVMObject value, string targetType)

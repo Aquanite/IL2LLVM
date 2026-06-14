@@ -29,9 +29,11 @@ namespace IL2LLVM.Compiler
 
         private static readonly Dictionary<string, string> nativeCalls = [];
         private static readonly Dictionary<string, MethodDefinition> plugReference = [];
+        private static readonly Dictionary<MethodDefinition, string> exports = [];
 
         public static void AddNativeCall(string before, string after) => nativeCalls.Add(before, after);
         public static void AddPlugReference(string toPlug, MethodDefinition toMangle) => plugReference.Add(toPlug, toMangle);
+        public static void AddExport(MethodDefinition toReplace, string toExport) => exports.Add(toReplace, toExport);
         public static MethodDefinition? GetPlugReference(string toPlug)
         {
             if (plugReference.TryGetValue(toPlug, out MethodDefinition? value))
@@ -44,6 +46,13 @@ namespace IL2LLVM.Compiler
             string fieldName = field.DeclaringType.FullName + ".f" + field.Name;
             fieldName = fieldName.Replace("`", ".bt."); // Sanitize generics
             return fieldName;
+        }
+
+        public static string Mangle(TypeReference field)
+        {
+            string rfieldName = field.FullName;
+            rfieldName = rfieldName.Replace("`", ".bt."); // Sanitize generics
+            return rfieldName;
         }
 
         public static string Mangle(MethodReference method)
@@ -70,6 +79,11 @@ namespace IL2LLVM.Compiler
 
         public static string Mangle(MethodDefinition method)
         {
+            if (exports.TryGetValue(method, out string? exportName) && !string.IsNullOrEmpty(exportName))
+            {
+                return exportName; // No mangling
+            }
+
             if (nativeCalls.TryGetValue(method.FullName, out string? nativeName) && !string.IsNullOrEmpty(nativeName))
             {
                 return nativeName; // No mangling

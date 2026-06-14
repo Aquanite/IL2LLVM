@@ -38,9 +38,9 @@ namespace IL2LLVM.Formulae
         )
         {
             if (returnType == "void")
-                return $"    call {Utility.GetLLVMConvention(callingConvention)} void @{(isIndirect ? name : '@' + name)}({string.Join(", ", parameters)})";
+                return $"    call {Utility.GetLLVMConvention(callingConvention)} void {(isIndirect ? name : '@' + name)}({string.Join(", ", parameters)})";
             else
-                return $"    {toSet} = call {Utility.GetLLVMConvention(callingConvention)} {returnType} @{(isIndirect ? name : '@' + name)}({string.Join(", ", parameters)})";
+                return $"    {toSet} = call {Utility.GetLLVMConvention(callingConvention)} {returnType} {(isIndirect ? name : '@' + name)}({string.Join(", ", parameters)})";
         }
     }
 }

@@ -1,25 +1,60 @@
 using IL2LLVM.Attributes;
-using ILTest2;
 
 namespace ILTest;
+
 public static class Program
 {
     [EntryPoint]
-    public unsafe static int Main()
+    public static int Main()
     {
-        nint addr = 0x12345678;
-        delegate* unmanaged[Stdcall]<string, void> printfPtr = (delegate* unmanaged[Stdcall]<string, void>)addr;
-        printfPtr("Hello, World!\n");
+        Native.ClearLCD();
+        Native.HomeUp();
+        Native.DrawStatusBar();
+        for (byte i = 0; i < 3; i++)
+        {
+            Console.WriteLine("Hello, C#!");
+        }
 
+        while (Native.GetCSC() == 0) {}
         return 0;
     }
+}
 
-    public static class Plugs
+public static class Native
+{
+    [NativeCall("os_ClrLCD")]
+    public static void ClearLCD() 
+        => throw new NotImplementedException();
+
+    [NativeCall("os_HomeUp")]
+    public static void HomeUp() 
+        => throw new NotImplementedException();
+
+    [NativeCall("os_DrawStatusBar")]
+    public static void DrawStatusBar() 
+        => throw new NotImplementedException();
+    
+    [NativeCall("os_PutStrFull")]
+    public static void PutStringFull(string str) 
+        => throw new NotImplementedException();
+    
+    [NativeCall("os_GetCSC")]
+    public static byte GetCSC() 
+        => throw new NotImplementedException();
+
+    [NativeCall("os_SetCursorPos")]
+    public static byte SetCursorPos(byte x, byte y)
+        => throw new NotImplementedException();
+}
+
+public static class Plugs
+{
+    static byte Row = 0;
+    [Plug("System.Void System.Console::WriteLine(System.String)")]
+    public static void CWriteLine(string value)
     {
-        [Plug("System.Void System.Console::WriteLine(System.String)")]
-        public static void CWriteLine(string value)
-        {
-            Native.PrintF(value);
-        }
+        Native.SetCursorPos(Row, 0);
+        Native.PutStringFull(value);
+        Row++;
     }
 }

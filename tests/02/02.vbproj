@@ -1,0 +1,14 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>ILTest</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="IL2LLVM.Attributes">
+      <HintPath>../IL2LLVM.Attributes.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
